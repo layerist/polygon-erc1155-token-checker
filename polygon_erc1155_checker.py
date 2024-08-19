@@ -75,8 +75,7 @@ async def process_address(session, address, file, i, total_addresses, start_time
     if tokens:
         async with asyncio.Lock():
             file.write(f"{address}\n")
-
-    # Обновление прогресса и оценка времени выполнения
+    
     elapsed_time = time.time() - start_time
     remaining_addresses = total_addresses - i
     avg_time_per_address = elapsed_time / i if i > 0 else 0
