@@ -5,12 +5,10 @@ import os
 import sys
 import logging
 
-# Задаем параметры через переменные окружения
 API_KEY = os.getenv("POLYGONSCAN_API_KEY", "YOUR_API_KEY")
 BASE_URL = "https://api.polygonscan.com/api"
 SAVE_FILE = "erc1155_addresses.txt"
 
-# Настраиваем логирование
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
