@@ -4,30 +4,35 @@ import time
 import os
 import sys
 import logging
+from contextlib import asynccontextmanager
 
 # Configuration constants
 API_KEY = os.getenv("POLYGONSCAN_API_KEY", "YOUR_API_KEY")
 BASE_URL = "https://api.polygonscan.com/api"
 SAVE_FILE = "erc1155_addresses.txt"
-MAX_CONCURRENT_TASKS = 10  # Limit concurrent tasks
+MAX_CONCURRENT_TASKS = 10
+RETRY_LIMIT = 3  # Retry limit for failed requests
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-async def fetch_json(session, url, params):
-    """Fetch JSON data from a given URL with provided parameters."""
-    try:
-        async with session.get(url, params=params) as response:
-            response.raise_for_status()
-            return await response.json()
-    except aiohttp.ClientResponseError as e:
-        logger.error(f"HTTP error: {e.status} {e.message} - URL: {url}")
-    except aiohttp.ClientError as e:
-        logger.error(f"Connection error: {e} - URL: {url}")
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-    return None
+@asynccontextmanager
+async def retry_request(session, url, params, retries=RETRY_LIMIT):
+    """A context manager that retries a failed HTTP request."""
+    for attempt in range(retries):
+        try:
+            async with session.get(url, params=params) as response:
+                response.raise_for_status()
+                yield await response.json()
+                return
+        except aiohttp.ClientResponseError as e:
+            logger.error(f"HTTP error {e.status}: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
+        except aiohttp.ClientError as e:
+            logger.error(f"Connection error: {e} - URL: {url} (Attempt {attempt + 1}/{retries})")
+        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+    logger.error(f"Failed to fetch data after {retries} attempts - URL: {url}")
+    yield None
 
 async def get_latest_block(session):
     """Retrieve the latest block number from the blockchain."""
@@ -36,12 +41,11 @@ async def get_latest_block(session):
         "action": "eth_blockNumber",
         "apikey": API_KEY
     }
-    data = await fetch_json(session, BASE_URL, params)
-    if data and "result" in data:
-        latest_block = int(data['result'], 16)
-        logger.info(f"Latest block number: {latest_block}")
-        return latest_block
-    logger.error("Failed to get the latest block")
+    async with retry_request(session, BASE_URL, params) as data:
+        if data and "result" in data:
+            latest_block = int(data['result'], 16)
+            logger.info(f"Latest block number: {latest_block}")
+            return latest_block
     return None
 
 async def get_block_transactions(session, block_number):
@@ -53,12 +57,11 @@ async def get_block_transactions(session, block_number):
         "boolean": "true",
         "apikey": API_KEY
     }
-    data = await fetch_json(session, BASE_URL, params)
-    if data and "result" in data:
-        transactions = data['result'].get('transactions', [])
-        logger.info(f"Retrieved {len(transactions)} transactions from block {block_number}")
-        return transactions
-    logger.error(f"Failed to retrieve transactions for block {block_number}")
+    async with retry_request(session, BASE_URL, params) as data:
+        if data and "result" in data:
+            transactions = data['result'].get('transactions', [])
+            logger.info(f"Retrieved {len(transactions)} transactions from block {block_number}")
+            return transactions
     return []
 
 async def get_erc1155_tokens(session, address):
@@ -72,11 +75,8 @@ async def get_erc1155_tokens(session, address):
         "sort": "asc",
         "apikey": API_KEY
     }
-    data = await fetch_json(session, BASE_URL, params)
-    if data and "result" in data:
-        return data['result']
-    logger.error(f"Failed to retrieve ERC1155 tokens for address {address}")
-    return []
+    async with retry_request(session, BASE_URL, params) as data:
+        return data.get('result', []) if data else []
 
 async def process_address(session, address, file, semaphore, i, total_addresses, start_time):
     """Process a single address to retrieve ERC1155 tokens and update progress."""
@@ -88,18 +88,18 @@ async def process_address(session, address, file, semaphore, i, total_addresses,
 
         # Progress and estimated time remaining
         elapsed_time = time.time() - start_time
-        remaining_addresses = total_addresses - i
         avg_time_per_address = elapsed_time / i if i > 0 else 0
-        remaining_time = avg_time_per_address * remaining_addresses
+        remaining_time = avg_time_per_address * (total_addresses - i)
         sys.stdout.write(
-            f"\rProgress: {i}/{total_addresses} addresses checked, "
+            f"\rProgress: {i}/{total_addresses} addresses checked "
+            f"({(i / total_addresses) * 100:.2f}%), "
             f"Estimated remaining time: {remaining_time:.2f} seconds"
         )
         sys.stdout.flush()
 
 async def main():
     """Main function to coordinate asynchronous tasks."""
-    async with aiohttp.ClientSession() as session, open(SAVE_FILE, "w") as file:
+    async with aiohttp.ClientSession() as session:
         latest_block = await get_latest_block(session)
         if latest_block is None:
             return
@@ -112,11 +112,12 @@ async def main():
         start_time = time.time()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
-        tasks = [
-            process_address(session, address, file, semaphore, i, total_addresses, start_time)
-            for i, address in enumerate(addresses, 1)
-        ]
-        await asyncio.gather(*tasks)
+        async with open(SAVE_FILE, "w") as file:
+            tasks = [
+                process_address(session, address, file, semaphore, i, total_addresses, start_time)
+                for i, address in enumerate(addresses, 1)
+            ]
+            await asyncio.gather(*tasks)
 
         logger.info("\nProcessing completed successfully.")
 
