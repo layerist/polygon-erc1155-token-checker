@@ -27,9 +27,9 @@ async def retry_request(session, url, params, retries=RETRY_LIMIT):
                 yield await response.json()
                 return
         except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error {e.status}: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
+            logger.warning(f"HTTP error {e.status}: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
         except aiohttp.ClientError as e:
-            logger.error(f"Connection error: {e} - URL: {url} (Attempt {attempt + 1}/{retries})")
+            logger.warning(f"Connection error: {e} - URL: {url} (Attempt {attempt + 1}/{retries})")
         await asyncio.sleep(2 ** attempt)  # Exponential backoff
     logger.error(f"Failed to fetch data after {retries} attempts - URL: {url}")
     yield None
@@ -80,10 +80,10 @@ async def get_erc1155_tokens(session, address):
 
 async def process_address(session, address, file, semaphore, i, total_addresses, start_time):
     """Process a single address to retrieve ERC1155 tokens and update progress."""
-    async with semaphore:  # Limit concurrent tasks
+    async with semaphore:
         tokens = await get_erc1155_tokens(session, address)
         if tokens:
-            async with asyncio.Lock():  # Ensure file writes are synchronized
+            async with asyncio.Lock():
                 file.write(f"{address}\n")
 
         # Progress and estimated time remaining
@@ -102,6 +102,7 @@ async def main():
     async with aiohttp.ClientSession() as session:
         latest_block = await get_latest_block(session)
         if latest_block is None:
+            logger.error("Failed to retrieve the latest block. Exiting.")
             return
 
         transactions = await get_block_transactions(session, latest_block)
@@ -119,10 +120,10 @@ async def main():
             ]
             await asyncio.gather(*tasks)
 
-        logger.info("\nProcessing completed successfully.")
+        logger.info("Processing completed successfully.")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\nScript interrupted by user. Exiting...")
+        logger.info("Script interrupted by user. Exiting...")
