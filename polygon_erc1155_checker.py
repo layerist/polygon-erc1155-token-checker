@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def retry_request(session, url, params, retries=RETRY_LIMIT):
-    """A context manager that retries a failed HTTP request."""
+    """Retry failed HTTP requests with exponential backoff."""
     for attempt in range(retries):
         try:
             async with session.get(url, params=params) as response:
@@ -35,7 +35,7 @@ async def retry_request(session, url, params, retries=RETRY_LIMIT):
     yield None
 
 async def get_latest_block(session):
-    """Retrieve the latest block number from the blockchain."""
+    """Retrieve the latest block number."""
     params = {
         "module": "proxy",
         "action": "eth_blockNumber",
@@ -43,13 +43,11 @@ async def get_latest_block(session):
     }
     async with retry_request(session, BASE_URL, params) as data:
         if data and "result" in data:
-            latest_block = int(data['result'], 16)
-            logger.info(f"Latest block number: {latest_block}")
-            return latest_block
+            return int(data['result'], 16)
     return None
 
 async def get_block_transactions(session, block_number):
-    """Retrieve all transactions for a given block number."""
+    """Retrieve transactions for a specific block."""
     params = {
         "module": "proxy",
         "action": "eth_getBlockByNumber",
@@ -59,13 +57,11 @@ async def get_block_transactions(session, block_number):
     }
     async with retry_request(session, BASE_URL, params) as data:
         if data and "result" in data:
-            transactions = data['result'].get('transactions', [])
-            logger.info(f"Retrieved {len(transactions)} transactions from block {block_number}")
-            return transactions
+            return data['result'].get('transactions', [])
     return []
 
 async def get_erc1155_tokens(session, address):
-    """Retrieve ERC1155 tokens for a given address."""
+    """Retrieve ERC1155 tokens for an address."""
     params = {
         "module": "account",
         "action": "tokennfttx",
@@ -79,40 +75,43 @@ async def get_erc1155_tokens(session, address):
         return data.get('result', []) if data else []
 
 async def process_address(session, address, file, semaphore, i, total_addresses, start_time):
-    """Process a single address to retrieve ERC1155 tokens and update progress."""
+    """Retrieve ERC1155 tokens for an address and track progress."""
     async with semaphore:
         tokens = await get_erc1155_tokens(session, address)
         if tokens:
             async with asyncio.Lock():
                 file.write(f"{address}\n")
 
-        # Progress and estimated time remaining
+        # Update progress
         elapsed_time = time.time() - start_time
         avg_time_per_address = elapsed_time / i if i > 0 else 0
         remaining_time = avg_time_per_address * (total_addresses - i)
         sys.stdout.write(
-            f"\rProgress: {i}/{total_addresses} addresses checked "
+            f"\rProgress: {i}/{total_addresses} addresses processed "
             f"({(i / total_addresses) * 100:.2f}%), "
-            f"Estimated remaining time: {remaining_time:.2f} seconds"
+            f"ETA: {remaining_time:.2f}s"
         )
         sys.stdout.flush()
 
 async def main():
-    """Main function to coordinate asynchronous tasks."""
+    """Main function to coordinate the tasks."""
     async with aiohttp.ClientSession() as session:
+        # Fetch the latest block number
         latest_block = await get_latest_block(session)
         if latest_block is None:
-            logger.error("Failed to retrieve the latest block. Exiting.")
+            logger.error("Unable to fetch the latest block. Exiting.")
             return
 
+        # Retrieve transactions and addresses
         transactions = await get_block_transactions(session, latest_block)
         addresses = {tx['from'] for tx in transactions} | {tx['to'] for tx in transactions}
         total_addresses = len(addresses)
-        logger.info(f"Found {total_addresses} unique addresses in the latest block")
+        logger.info(f"Found {total_addresses} unique addresses in block {latest_block}")
 
         start_time = time.time()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 
+        # Process addresses concurrently
         async with open(SAVE_FILE, "w") as file:
             tasks = [
                 process_address(session, address, file, semaphore, i, total_addresses, start_time)
@@ -120,7 +119,7 @@ async def main():
             ]
             await asyncio.gather(*tasks)
 
-        logger.info("Processing completed successfully.")
+        logger.info("All addresses processed successfully.")
 
 if __name__ == "__main__":
     try:
