@@ -5,6 +5,7 @@ import os
 import sys
 import logging
 from contextlib import asynccontextmanager
+from typing import Optional, Dict, Any, List
 
 # Configuration constants
 API_KEY = os.getenv("POLYGONSCAN_API_KEY", "YOUR_API_KEY")
@@ -18,7 +19,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 @asynccontextmanager
-async def retry_request(session, url, params, retries=RETRY_LIMIT):
+async def retry_request(
+    session: aiohttp.ClientSession, url: str, params: Dict[str, Any], retries: int = RETRY_LIMIT
+) -> Optional[Dict[str, Any]]:
     """Retry failed HTTP requests with exponential backoff."""
     for attempt in range(retries):
         try:
@@ -27,14 +30,14 @@ async def retry_request(session, url, params, retries=RETRY_LIMIT):
                 yield await response.json()
                 return
         except aiohttp.ClientResponseError as e:
-            logger.warning(f"HTTP error {e.status}: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
+            logger.warning(f"HTTP {e.status} error: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
         except aiohttp.ClientError as e:
             logger.warning(f"Connection error: {e} - URL: {url} (Attempt {attempt + 1}/{retries})")
         await asyncio.sleep(2 ** attempt)  # Exponential backoff
     logger.error(f"Failed to fetch data after {retries} attempts - URL: {url}")
     yield None
 
-async def get_latest_block(session):
+async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     """Retrieve the latest block number."""
     params = {
         "module": "proxy",
@@ -46,7 +49,7 @@ async def get_latest_block(session):
             return int(data['result'], 16)
     return None
 
-async def get_block_transactions(session, block_number):
+async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> List[Dict[str, Any]]:
     """Retrieve transactions for a specific block."""
     params = {
         "module": "proxy",
@@ -60,7 +63,7 @@ async def get_block_transactions(session, block_number):
             return data['result'].get('transactions', [])
     return []
 
-async def get_erc1155_tokens(session, address):
+async def get_erc1155_tokens(session: aiohttp.ClientSession, address: str) -> List[Dict[str, Any]]:
     """Retrieve ERC1155 tokens for an address."""
     params = {
         "module": "account",
@@ -74,13 +77,23 @@ async def get_erc1155_tokens(session, address):
     async with retry_request(session, BASE_URL, params) as data:
         return data.get('result', []) if data else []
 
-async def process_address(session, address, file, semaphore, i, total_addresses, start_time):
+async def process_address(
+    session: aiohttp.ClientSession,
+    address: str,
+    file_lock: asyncio.Lock,
+    file_path: str,
+    semaphore: asyncio.Semaphore,
+    i: int,
+    total_addresses: int,
+    start_time: float
+) -> None:
     """Retrieve ERC1155 tokens for an address and track progress."""
     async with semaphore:
         tokens = await get_erc1155_tokens(session, address)
         if tokens:
-            async with asyncio.Lock():
-                file.write(f"{address}\n")
+            async with file_lock:
+                async with aiofiles.open(file_path, "a") as file:
+                    await file.write(f"{address}\n")
 
         # Update progress
         elapsed_time = time.time() - start_time
@@ -110,11 +123,12 @@ async def main():
 
         start_time = time.time()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+        file_lock = asyncio.Lock()
 
         # Process addresses concurrently
-        async with open(SAVE_FILE, "w") as file:
+        async with aiofiles.open(SAVE_FILE, "w") as _:  # Initialize the file
             tasks = [
-                process_address(session, address, file, semaphore, i, total_addresses, start_time)
+                process_address(session, address, file_lock, SAVE_FILE, semaphore, i, total_addresses, start_time)
                 for i, address in enumerate(addresses, 1)
             ]
             await asyncio.gather(*tasks)
