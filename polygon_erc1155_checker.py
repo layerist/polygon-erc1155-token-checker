@@ -1,11 +1,12 @@
 import asyncio
 import aiohttp
+import aiofiles
 import time
 import os
-import sys
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
+from tqdm.asyncio import tqdm
 
 # Configuration constants
 API_KEY = os.getenv("POLYGONSCAN_API_KEY", "YOUR_API_KEY")
@@ -82,29 +83,15 @@ async def process_address(
     address: str,
     file_lock: asyncio.Lock,
     file_path: str,
-    semaphore: asyncio.Semaphore,
-    i: int,
-    total_addresses: int,
-    start_time: float
+    semaphore: asyncio.Semaphore
 ) -> None:
-    """Retrieve ERC1155 tokens for an address and track progress."""
+    """Retrieve ERC1155 tokens for an address and save it if applicable."""
     async with semaphore:
         tokens = await get_erc1155_tokens(session, address)
         if tokens:
             async with file_lock:
                 async with aiofiles.open(file_path, "a") as file:
                     await file.write(f"{address}\n")
-
-        # Update progress
-        elapsed_time = time.time() - start_time
-        avg_time_per_address = elapsed_time / i if i > 0 else 0
-        remaining_time = avg_time_per_address * (total_addresses - i)
-        sys.stdout.write(
-            f"\rProgress: {i}/{total_addresses} addresses processed "
-            f"({(i / total_addresses) * 100:.2f}%), "
-            f"ETA: {remaining_time:.2f}s"
-        )
-        sys.stdout.flush()
 
 async def main():
     """Main function to coordinate the tasks."""
@@ -117,21 +104,23 @@ async def main():
 
         # Retrieve transactions and addresses
         transactions = await get_block_transactions(session, latest_block)
-        addresses = {tx['from'] for tx in transactions} | {tx['to'] for tx in transactions}
+        addresses: Set[str] = {tx['from'] for tx in transactions} | {tx['to'] for tx in transactions}
         total_addresses = len(addresses)
         logger.info(f"Found {total_addresses} unique addresses in block {latest_block}")
 
-        start_time = time.time()
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         file_lock = asyncio.Lock()
 
-        # Process addresses concurrently
-        async with aiofiles.open(SAVE_FILE, "w") as _:  # Initialize the file
-            tasks = [
-                process_address(session, address, file_lock, SAVE_FILE, semaphore, i, total_addresses, start_time)
-                for i, address in enumerate(addresses, 1)
-            ]
-            await asyncio.gather(*tasks)
+        # Initialize the output file
+        async with aiofiles.open(SAVE_FILE, "w") as _:
+            pass
+
+        # Process addresses with progress tracking
+        tasks = [
+            process_address(session, address, file_lock, SAVE_FILE, semaphore)
+            for address in tqdm(addresses, desc="Processing addresses")
+        ]
+        await asyncio.gather(*tasks)
 
         logger.info("All addresses processed successfully.")
 
