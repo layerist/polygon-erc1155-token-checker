@@ -14,6 +14,7 @@ BASE_URL = "https://api.polygonscan.com/api"
 SAVE_FILE = "erc1155_addresses.txt"
 MAX_CONCURRENT_TASKS = 10
 RETRY_LIMIT = 3  # Retry limit for failed requests
+BACKOFF_DELAY = 2  # Initial delay for exponential backoff
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -26,28 +27,24 @@ async def retry_request(
     """Retry failed HTTP requests with exponential backoff."""
     for attempt in range(retries):
         try:
-            async with session.get(url, params=params) as response:
+            async with session.get(url, params=params, timeout=10) as response:
                 response.raise_for_status()
                 yield await response.json()
                 return
-        except aiohttp.ClientResponseError as e:
-            logger.warning(f"HTTP {e.status} error: {e.message} - URL: {url} (Attempt {attempt + 1}/{retries})")
-        except aiohttp.ClientError as e:
-            logger.warning(f"Connection error: {e} - URL: {url} (Attempt {attempt + 1}/{retries})")
-        await asyncio.sleep(2 ** attempt)  # Exponential backoff
+        except (aiohttp.ClientResponseError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(
+                f"Error during request: {e} - URL: {url} (Attempt {attempt + 1}/{retries})"
+            )
+        await asyncio.sleep(BACKOFF_DELAY * (2 ** attempt))  # Exponential backoff
     logger.error(f"Failed to fetch data after {retries} attempts - URL: {url}")
     yield None
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
     """Retrieve the latest block number."""
-    params = {
-        "module": "proxy",
-        "action": "eth_blockNumber",
-        "apikey": API_KEY
-    }
+    params = {"module": "proxy", "action": "eth_blockNumber", "apikey": API_KEY}
     async with retry_request(session, BASE_URL, params) as data:
         if data and "result" in data:
-            return int(data['result'], 16)
+            return int(data["result"], 16)
     return None
 
 async def get_block_transactions(session: aiohttp.ClientSession, block_number: int) -> List[Dict[str, Any]]:
@@ -57,11 +54,11 @@ async def get_block_transactions(session: aiohttp.ClientSession, block_number: i
         "action": "eth_getBlockByNumber",
         "tag": hex(block_number),
         "boolean": "true",
-        "apikey": API_KEY
+        "apikey": API_KEY,
     }
     async with retry_request(session, BASE_URL, params) as data:
         if data and "result" in data:
-            return data['result'].get('transactions', [])
+            return data["result"].get("transactions", [])
     return []
 
 async def get_erc1155_tokens(session: aiohttp.ClientSession, address: str) -> List[Dict[str, Any]]:
@@ -73,17 +70,17 @@ async def get_erc1155_tokens(session: aiohttp.ClientSession, address: str) -> Li
         "startblock": 0,
         "endblock": 99999999,
         "sort": "asc",
-        "apikey": API_KEY
+        "apikey": API_KEY,
     }
     async with retry_request(session, BASE_URL, params) as data:
-        return data.get('result', []) if data else []
+        return data.get("result", []) if data else []
 
 async def process_address(
     session: aiohttp.ClientSession,
     address: str,
     file_lock: asyncio.Lock,
     file_path: str,
-    semaphore: asyncio.Semaphore
+    semaphore: asyncio.Semaphore,
 ) -> None:
     """Retrieve ERC1155 tokens for an address and save it if applicable."""
     async with semaphore:
@@ -102,12 +99,15 @@ async def main():
             logger.error("Unable to fetch the latest block. Exiting.")
             return
 
-        # Retrieve transactions and addresses
+        # Retrieve transactions and extract unique addresses
         transactions = await get_block_transactions(session, latest_block)
-        addresses: Set[str] = {tx['from'] for tx in transactions} | {tx['to'] for tx in transactions}
+        addresses: Set[str] = {tx["from"] for tx in transactions if "from" in tx} | {
+            tx["to"] for tx in transactions if "to" in tx
+        }
         total_addresses = len(addresses)
         logger.info(f"Found {total_addresses} unique addresses in block {latest_block}")
 
+        # Prepare for concurrent processing
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
         file_lock = asyncio.Lock()
 
