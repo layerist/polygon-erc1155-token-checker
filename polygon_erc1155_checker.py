@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import asyncio
 import aiohttp
 import aiofiles
@@ -10,9 +12,9 @@ from dataclasses import dataclass
 from aiohttp import ClientTimeout, TCPConnector
 
 
-# ===========================
+# ==========================================================
 # CONFIG
-# ===========================
+# ==========================================================
 
 @dataclass(frozen=True)
 class Config:
@@ -26,16 +28,16 @@ class Config:
     dns_ttl: int = 300
 
     backoff_base: float = 2.0
-    min_request_delay: float = 0.25
     max_backoff: float = 60.0
+    min_request_delay: float = 0.25
 
 
 CFG = Config()
 
 
-# ===========================
+# ==========================================================
 # LOGGING
-# ===========================
+# ==========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,34 +46,39 @@ logging.basicConfig(
 logger = logging.getLogger("erc1155_scanner")
 
 
-# ===========================
-# NETWORK HELPERS
-# ===========================
+# ==========================================================
+# NETWORK UTILITIES
+# ==========================================================
 
 async def exponential_backoff(attempt: int) -> None:
+    """Sleep using exponential backoff with jitter."""
     delay = min(CFG.backoff_base ** attempt, CFG.max_backoff)
-    delay += random.uniform(0.2, 0.6)
-    await asyncio.sleep(delay)
+    jitter = random.uniform(0.2, 0.6)
+    await asyncio.sleep(delay + jitter)
 
 
 async def fetch_json(
     session: aiohttp.ClientSession,
     params: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
-    params["apikey"] = CFG.api_key
+    """Perform GET request with retry and rate-limit handling."""
+
+    request_params = {**params, "apikey": CFG.api_key}
 
     for attempt in range(1, CFG.retry_limit + 1):
         try:
-            async with session.get(CFG.base_url, params=params) as resp:
+            async with session.get(CFG.base_url, params=request_params) as resp:
                 text = await resp.text()
 
+                # Rate limit handling
                 if resp.status == 429 or "rate limit" in text.lower():
-                    logger.warning("Rate limit hit, backing off")
+                    logger.warning("Rate limit hit (attempt %s)", attempt)
                     await exponential_backoff(attempt)
                     continue
 
+                # Server errors
                 if resp.status >= 500:
-                    logger.warning("Server error %s, retrying", resp.status)
+                    logger.warning("Server error %s (attempt %s)", resp.status, attempt)
                     await exponential_backoff(attempt)
                     continue
 
@@ -79,22 +86,22 @@ async def fetch_json(
                 return await resp.json(content_type=None)
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning("HTTP error (attempt %s): %s", attempt, e)
+            logger.warning("Request error (attempt %s): %s", attempt, e)
             await exponential_backoff(attempt)
 
-        except Exception as e:
-            logger.error("Unexpected fetch error: %s", e)
+        except Exception:
+            logger.exception("Unexpected fetch error")
             return None
 
     logger.error("Request failed after %s attempts: %s", CFG.retry_limit, params)
     return None
 
 
-# ===========================
+# ==========================================================
 # BLOCKCHAIN HELPERS
-# ===========================
+# ==========================================================
 
-def normalize_addr(addr: Optional[str]) -> Optional[str]:
+def normalize_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
         return None
     addr = addr.lower()
@@ -114,20 +121,24 @@ async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
 
 async def get_block_transactions(
     session: aiohttp.ClientSession,
-    block: int,
+    block_number: int,
 ) -> List[Dict[str, Any]]:
     data = await fetch_json(session, {
         "module": "proxy",
         "action": "eth_getBlockByNumber",
-        "tag": hex(block),
+        "tag": hex(block_number),
         "boolean": "true",
     })
-    return data.get("result", {}).get("transactions", []) if isinstance(data, dict) else []
+
+    if not isinstance(data, dict):
+        return []
+
+    return data.get("result", {}).get("transactions", [])
 
 
-# ===========================
+# ==========================================================
 # ERC-1155 DETECTION
-# ===========================
+# ==========================================================
 
 async def has_erc1155_activity(
     session: aiohttp.ClientSession,
@@ -142,9 +153,10 @@ async def has_erc1155_activity(
         "sort": "asc",
     })
 
-    await asyncio.sleep(CFG.min_request_delay * random.uniform(0.9, 1.1))
+    if not isinstance(data, dict):
+        return False
 
-    txs = data.get("result") if isinstance(data, dict) else None
+    txs = data.get("result")
     if not isinstance(txs, list):
         return False
 
@@ -153,38 +165,42 @@ async def has_erc1155_activity(
 
 async def process_address(
     session: aiohttp.ClientSession,
-    sem: asyncio.Semaphore,
+    semaphore: asyncio.Semaphore,
     address: str,
 ) -> Optional[str]:
-    async with sem:
+    async with semaphore:
         try:
             if await has_erc1155_activity(session, address):
+                logger.info("ERC-1155 detected: %s", address)
                 return address
-        except Exception as e:
-            logger.error("Address %s failed: %s", address, e)
+        except Exception:
+            logger.exception("Address processing failed: %s", address)
+        finally:
+            # Soft pacing between account requests
+            await asyncio.sleep(CFG.min_request_delay)
+
     return None
 
 
-async def bounded_gather(
-    coros: Iterable[asyncio.Future],
-) -> List[Any]:
+async def gather_as_completed(tasks: Iterable[asyncio.Task]) -> List[Any]:
     results: List[Any] = []
-    for coro in asyncio.as_completed(coros):
-        results.append(await coro)
+    for task in asyncio.as_completed(tasks):
+        results.append(await task)
     return results
 
 
-# ===========================
+# ==========================================================
 # FILE HELPERS
-# ===========================
+# ==========================================================
 
 async def load_existing(path: str) -> Set[str]:
     if not os.path.exists(path):
         return set()
+
     async with aiofiles.open(path, "r") as f:
         return {
             line.strip().lower()
-            for line in await f.readlines()
+            for line in await f
             if line.strip()
         }
 
@@ -192,20 +208,21 @@ async def load_existing(path: str) -> Set[str]:
 async def append_results(path: str, addresses: List[str]) -> None:
     if not addresses:
         return
+
     async with aiofiles.open(path, "a") as f:
         await f.write("\n".join(addresses) + "\n")
 
 
-# ===========================
+# ==========================================================
 # MAIN
-# ===========================
+# ==========================================================
 
 async def main() -> None:
     if not CFG.api_key:
         raise RuntimeError("POLYGONSCAN_API_KEY is not set")
 
     logger.info("Starting ERC-1155 scanner")
-    start = time.time()
+    start_time = time.perf_counter()
 
     existing = await load_existing(CFG.output_file)
     logger.info("Loaded %s existing addresses", len(existing))
@@ -216,36 +233,44 @@ async def main() -> None:
         ttl_dns_cache=CFG.dns_ttl,
     )
 
-    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-        block = await get_latest_block(session)
-        if block is None:
+    async with aiohttp.ClientSession(
+        timeout=timeout,
+        connector=connector,
+    ) as session:
+
+        latest_block = await get_latest_block(session)
+        if latest_block is None:
             logger.error("Failed to fetch latest block")
             return
 
-        logger.info("Latest block: %s", block)
-        txs = await get_block_transactions(session, block)
+        logger.info("Latest block: %s", latest_block)
+
+        transactions = await get_block_transactions(session, latest_block)
 
         raw_addresses = {
-            normalize_addr(tx.get(field))
-            for tx in txs
+            normalize_address(tx.get(field))
+            for tx in transactions
             for field in ("from", "to")
         }
 
         addresses = {a for a in raw_addresses if a} - existing
+
         if not addresses:
             logger.info("No new addresses to scan")
             return
 
         logger.info("Scanning %s addresses", len(addresses))
 
-        sem = asyncio.Semaphore(CFG.max_concurrency)
+        semaphore = asyncio.Semaphore(CFG.max_concurrency)
         tasks = [
-            process_address(session, sem, addr)
+            asyncio.create_task(
+                process_address(session, semaphore, addr)
+            )
             for addr in addresses
         ]
 
-        results = await bounded_gather(tasks)
-        found = sorted({r for r in results if r})
+        results = await gather_as_completed(tasks)
+        found = sorted({addr for addr in results if addr})
 
         if found:
             await append_results(CFG.output_file, found)
@@ -253,7 +278,8 @@ async def main() -> None:
         else:
             logger.info("No ERC-1155 activity detected")
 
-    logger.info("Completed in %.2fs", time.time() - start)
+    elapsed = time.perf_counter() - start_time
+    logger.info("Completed in %.2f seconds", elapsed)
 
 
 if __name__ == "__main__":
