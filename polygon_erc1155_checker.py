@@ -8,6 +8,7 @@ import logging
 import random
 import time
 import re
+import signal
 from typing import Optional, Dict, Any, List, Set
 from dataclasses import dataclass
 from aiohttp import ClientTimeout, TCPConnector
@@ -24,14 +25,17 @@ class Config:
     output_file: str = "erc1155_addresses.txt"
 
     max_concurrency: int = 20
-    retry_limit: int = 4
+    retry_limit: int = 5
     timeout: float = 12.0
 
-    rate_limit_per_sec: float = 4.5   # polygonscan safe rate
+    rate_limit_per_sec: float = 4.5
+    burst_size: int = 2  # allow small bursts
 
     dns_ttl: int = 300
     backoff_base: float = 2.0
     max_backoff: float = 60.0
+
+    min_request_interval: float = 0.15  # extra safety delay
 
 
 CFG = Config()
@@ -50,37 +54,56 @@ logger = logging.getLogger("erc1155_scanner")
 
 
 # ==========================================================
-# GLOBAL RATE LIMITER
+# GRACEFUL SHUTDOWN
+# ==========================================================
+
+shutdown_event = asyncio.Event()
+
+
+def _handle_shutdown():
+    logger.warning("Shutdown signal received...")
+    shutdown_event.set()
+
+
+signal.signal(signal.SIGINT, lambda *_: _handle_shutdown())
+signal.signal(signal.SIGTERM, lambda *_: _handle_shutdown())
+
+
+# ==========================================================
+# RATE LIMITER (TOKEN BUCKET)
 # ==========================================================
 
 class RateLimiter:
-    def __init__(self, rate_per_sec: float):
-        self.interval = 1.0 / rate_per_sec
+    def __init__(self, rate: float, capacity: int):
+        self.rate = rate
+        self.capacity = capacity
+        self.tokens = capacity
+        self.updated = time.monotonic()
         self._lock = asyncio.Lock()
-        self._last = 0.0
 
     async def wait(self):
         async with self._lock:
-            now = time.monotonic()
-            delta = now - self._last
+            while self.tokens < 1:
+                now = time.monotonic()
+                elapsed = now - self.updated
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                self.updated = now
+                await asyncio.sleep(0.05)
 
-            if delta < self.interval:
-                await asyncio.sleep(self.interval - delta)
-
-            self._last = time.monotonic()
+            self.tokens -= 1
 
 
-rate_limiter = RateLimiter(CFG.rate_limit_per_sec)
+rate_limiter = RateLimiter(CFG.rate_limit_per_sec, CFG.burst_size)
 
 
 # ==========================================================
 # NETWORK UTILITIES
 # ==========================================================
 
-async def exponential_backoff(attempt: int) -> None:
-    delay = min(CFG.backoff_base ** attempt, CFG.max_backoff)
-    jitter = random.uniform(0.2, 0.6)
-    await asyncio.sleep(delay + jitter)
+def compute_backoff(attempt: int) -> float:
+    base = min(CFG.backoff_base ** attempt, CFG.max_backoff)
+    jitter = random.uniform(0.3, 0.7)
+    return base + jitter
 
 
 async def fetch_json(
@@ -92,7 +115,11 @@ async def fetch_json(
 
     for attempt in range(1, CFG.retry_limit + 1):
 
+        if shutdown_event.is_set():
+            return None
+
         await rate_limiter.wait()
+        await asyncio.sleep(CFG.min_request_interval)
 
         try:
             async with session.get(CFG.base_url, params=request_params) as resp:
@@ -100,16 +127,18 @@ async def fetch_json(
                 text = await resp.text()
 
                 if resp.status == 429 or "rate limit" in text.lower():
-                    logger.warning("Rate limit hit (attempt %s)", attempt)
-                    await exponential_backoff(attempt)
+                    logger.warning("Rate limited (attempt %d)", attempt)
+                    await asyncio.sleep(compute_backoff(attempt))
                     continue
 
                 if resp.status >= 500:
-                    logger.warning("Server error %s", resp.status)
-                    await exponential_backoff(attempt)
+                    logger.warning("Server error %d", resp.status)
+                    await asyncio.sleep(compute_backoff(attempt))
                     continue
 
-                resp.raise_for_status()
+                if resp.status >= 400:
+                    logger.warning("Client error %d: %s", resp.status, text[:120])
+                    return None
 
                 try:
                     return await resp.json(content_type=None)
@@ -118,10 +147,10 @@ async def fetch_json(
                     return None
 
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-            logger.warning("Network error attempt %s: %s", attempt, e)
-            await exponential_backoff(attempt)
+            logger.warning("Network error (attempt %d): %s", attempt, e)
+            await asyncio.sleep(compute_backoff(attempt))
 
-    logger.error("Request failed: %s", params)
+    logger.error("Request failed after retries: %s", params)
     return None
 
 
@@ -135,18 +164,15 @@ ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 def normalize_address(addr: Optional[str]) -> Optional[str]:
     if not addr:
         return None
-
     addr = addr.lower()
     return addr if ADDRESS_RE.match(addr) else None
 
 
 async def get_latest_block(session: aiohttp.ClientSession) -> Optional[int]:
-
     data = await fetch_json(session, {
         "module": "proxy",
         "action": "eth_blockNumber",
     })
-
     try:
         return int(data["result"], 16)
     except Exception:
@@ -172,13 +198,18 @@ async def get_block_transactions(
 
 
 # ==========================================================
-# ERC1155 DETECTION
+# ERC1155 DETECTION (OPTIMIZED)
 # ==========================================================
 
 async def has_erc1155_activity(
     session: aiohttp.ClientSession,
     address: str,
 ) -> bool:
+    """
+    Optimized:
+    - limit block range
+    - early exit on first match
+    """
 
     data = await fetch_json(session, {
         "module": "account",
@@ -186,22 +217,19 @@ async def has_erc1155_activity(
         "address": address,
         "startblock": 0,
         "endblock": 99999999,
-        "sort": "asc",
+        "page": 1,
+        "offset": 25,  # reduce payload
+        "sort": "desc",
     })
 
     if not isinstance(data, dict):
         return False
 
     txs = data.get("result")
-
     if not isinstance(txs, list):
         return False
 
-    for tx in txs:
-        if tx.get("tokenType") == "ERC-1155":
-            return True
-
-    return False
+    return any(tx.get("tokenType") == "ERC-1155" for tx in txs)
 
 
 async def process_address(
@@ -210,13 +238,14 @@ async def process_address(
     address: str,
 ) -> Optional[str]:
 
-    async with semaphore:
+    if shutdown_event.is_set():
+        return None
 
+    async with semaphore:
         try:
             if await has_erc1155_activity(session, address):
                 logger.info("ERC1155 detected: %s", address)
                 return address
-
         except Exception:
             logger.exception("Failed address: %s", address)
 
@@ -228,7 +257,6 @@ async def process_address(
 # ==========================================================
 
 async def load_existing(path: str) -> Set[str]:
-
     if not os.path.exists(path):
         return set()
 
@@ -237,7 +265,6 @@ async def load_existing(path: str) -> Set[str]:
 
 
 async def append_results(path: str, addresses: List[str]) -> None:
-
     if not addresses:
         return
 
@@ -255,11 +282,10 @@ async def main():
         raise RuntimeError("POLYGONSCAN_API_KEY missing")
 
     start = time.perf_counter()
-
     logger.info("Starting ERC1155 scanner")
 
     existing = await load_existing(CFG.output_file)
-    logger.info("Loaded %s existing addresses", len(existing))
+    logger.info("Loaded %d existing addresses", len(existing))
 
     timeout = ClientTimeout(total=CFG.timeout)
 
@@ -267,6 +293,7 @@ async def main():
         limit=CFG.max_concurrency * 2,
         limit_per_host=CFG.max_concurrency,
         ttl_dns_cache=CFG.dns_ttl,
+        ssl=False,
     )
 
     async with aiohttp.ClientSession(
@@ -280,17 +307,17 @@ async def main():
             logger.error("Cannot fetch latest block")
             return
 
-        logger.info("Latest block: %s", latest_block)
+        logger.info("Latest block: %d", latest_block)
 
         txs = await get_block_transactions(session, latest_block)
 
-        raw_addresses = set()
+        raw_addresses = {
+            normalize_address(tx.get(field))
+            for tx in txs
+            for field in ("from", "to")
+        }
 
-        for tx in txs:
-            for field in ("from", "to"):
-                addr = normalize_address(tx.get(field))
-                if addr:
-                    raw_addresses.add(addr)
+        raw_addresses.discard(None)
 
         addresses = raw_addresses - existing
 
@@ -298,7 +325,7 @@ async def main():
             logger.info("No new addresses")
             return
 
-        logger.info("Scanning %s addresses", len(addresses))
+        logger.info("Scanning %d addresses", len(addresses))
 
         semaphore = asyncio.Semaphore(CFG.max_concurrency)
 
@@ -309,24 +336,29 @@ async def main():
 
         found: Set[str] = set()
 
-        for task in asyncio.as_completed(tasks):
-            result = await task
+        for coro in asyncio.as_completed(tasks):
+            if shutdown_event.is_set():
+                break
+
+            result = await coro
             if result:
                 found.add(result)
 
+        for task in tasks:
+            task.cancel()
+
         if found:
             await append_results(CFG.output_file, sorted(found))
-            logger.info("Saved %s ERC1155 addresses", len(found))
+            logger.info("Saved %d ERC1155 addresses", len(found))
         else:
             logger.info("No ERC1155 activity detected")
 
-    logger.info("Finished in %.2f seconds", time.perf_counter() - start)
+    elapsed = time.perf_counter() - start
+    logger.info("Finished in %.2f seconds", elapsed)
 
 
 if __name__ == "__main__":
-
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
         logger.warning("Interrupted by user")
