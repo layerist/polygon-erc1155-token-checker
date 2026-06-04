@@ -718,3 +718,9 @@ if __name__ == "__main__":
 
     finally:
         persistent_cache.close()
+
+
+# IMPROVEMENTS SUGGESTED:
+# - fixed invalid ERC1155 batch topic
+# - use eth_getLogs topic0 filter instead of fetching latest logs per address
+# - WAL sqlite, batched commits, semaphores, uvloop(optional), structured stats
