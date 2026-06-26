@@ -1,124 +1,46 @@
 #!/usr/bin/env python3
-
 """
-Ultra-fast Polygon ERC1155 activity scanner.
+Fast Polygon ERC1155 activity scanner.
 
-Improvements over original:
-- Real ERC1155 topic detection (TransferSingle + TransferBatch)
-- Global async rate limiter with burst support
-- High-performance worker queue architecture
-- Shared in-memory + persistent cache
-- Better retry logic with exponential jitter backoff
-- Automatic session recovery
-- Deduplicated async file writer
-- Efficient block scanning pipeline
-- Graceful cancellation
-- Memory-safe large-scale processing
-- Better logging/statistics
-- Faster log filtering using topic0
-- Optional persistent SQLite cache
-- Contract-only filtering
-- Reduced unnecessary API calls
+Core idea:
+- Do NOT scan block transactions and then check every tx.from / tx.to address.
+- Scan logs directly by ERC1155 TransferSingle / TransferBatch topic0.
+- The ERC1155 contract address is log["address"].
 
 Requirements:
-    pip install aiohttp aiofiles
+    pip install aiohttp
 
-Usage:
+Examples:
     export POLYGONSCAN_API_KEY=YOUR_KEY
-    python scanner.py
+    python erc1155_polygon_scanner_improved.py --blocks 500
+    python erc1155_polygon_scanner_improved.py --from-block 65000000 --to-block latest
+    python erc1155_polygon_scanner_improved.py --blocks 2000 --chunk-size 100 --page-size 1000
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
-import aiohttp
-import aiofiles
+import json
 import logging
 import os
 import random
 import signal
-import sqlite3
 import sys
 import time
-import re
-
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Set, List
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+import aiohttp
 from aiohttp import ClientTimeout, TCPConnector
-from collections import OrderedDict
+
 
 # ==========================================================
-# CONFIG
+# CONSTANTS
 # ==========================================================
 
-@dataclass(frozen=True)
-class Config:
-    api_key: str = os.getenv("POLYGONSCAN_API_KEY", "")
-
-    base_url: str = "https://api.polygonscan.com/api"
-
-    output_file: str = "erc1155_addresses.txt"
-    sqlite_cache_file: str = "scanner_cache.db"
-
-    # Performance
-    max_concurrency: int = 50
-    worker_count: int = 50
-
-    # Network
-    timeout: float = 15.0
-    retry_limit: int = 6
-
-    # Rate limiting
-    rate_limit_per_sec: float = 4.8
-    burst_size: int = 5
-
-    # Block scanning
-    blocks_to_scan: int = 20
-
-    # Queue/chunk tuning
-    address_queue_size: int = 10000
-
-    # Cache
-    memory_cache_size: int = 100000
-
-    # Retry backoff
-    backoff_base: float = 1.8
-    max_backoff: float = 45.0
-
-    # Network optimizations
-    dns_ttl: int = 300
-    tcp_limit_multiplier: int = 3
-
-    # Save output every N results
-    flush_every: int = 25
-
-CFG = Config()
-
-# ==========================================================
-# LOGGING
-# ==========================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-7s | %(message)s",
-)
-
-logger = logging.getLogger("erc1155_scanner")
-
-# ==========================================================
-# SIGNALS
-# ==========================================================
-
-shutdown_event = asyncio.Event()
-
-def shutdown_handler():
-    logger.warning("Shutdown requested...")
-    shutdown_event.set()
-
-signal.signal(signal.SIGINT, lambda *_: shutdown_handler())
-signal.signal(signal.SIGTERM, lambda *_: shutdown_handler())
-
-# ==========================================================
-# ERC1155 TOPICS
-# ==========================================================
+POLYGONSCAN_URL = "https://api.polygonscan.com/api"
 
 # keccak256("TransferSingle(address,address,address,uint256,uint256)")
 ERC1155_TRANSFER_SINGLE = (
@@ -127,600 +49,582 @@ ERC1155_TRANSFER_SINGLE = (
 
 # keccak256("TransferBatch(address,address,address,uint256[],uint256[])")
 ERC1155_TRANSFER_BATCH = (
-    "0x4a39dc06d4c0dbc64b70e4c2d6b4c7f6"
-    "b0d3fcb5b8d4f0f2d6a0a6d6c6f6f6f"
+    "0x4a39dc06d4c0dbc64b70af90fd698a233a518aa5d07e595d983b8c0526c8f7fb"
 )
 
-ERC1155_TOPICS = {
-    ERC1155_TRANSFER_SINGLE.lower(),
-    ERC1155_TRANSFER_BATCH.lower(),
-}
+ERC1155_TOPICS = (
+    ERC1155_TRANSFER_SINGLE,
+    ERC1155_TRANSFER_BATCH,
+)
+
+NO_RECORDS_MARKERS = (
+    "no records found",
+    "no record found",
+)
+
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "max rate limit reached",
+    "too many requests",
+)
+
 
 # ==========================================================
-# ADDRESS VALIDATION
+# CONFIG / STATS
 # ==========================================================
 
-ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+@dataclass(frozen=True)
+class Config:
+    api_key: str
+    base_url: str
+    output_file: Path
+    state_file: Path
+    blocks: int
+    from_block: Optional[int]
+    to_block: str
+    chunk_size: int
+    page_size: int
+    rate_limit_per_sec: float
+    burst_size: int
+    concurrency: int
+    timeout: float
+    retry_limit: int
+    backoff_base: float
+    max_backoff: float
+    dns_ttl: int
+    resume: bool
+    save_state: bool
 
-def normalize_address(addr: Optional[str]) -> Optional[str]:
-    if not addr:
-        return None
 
-    addr = addr.lower()
+@dataclass
+class Stats:
+    chunks_done: int = 0
+    log_pages: int = 0
+    logs_seen: int = 0
+    unique_contracts: int = 0
+    new_contracts: int = 0
+    retries: int = 0
+    rate_limits: int = 0
+    started_at: float = 0.0
 
-    if ADDRESS_RE.match(addr):
-        return addr
+    def elapsed(self) -> float:
+        return max(0.001, time.perf_counter() - self.started_at)
 
-    return None
+
+# ==========================================================
+# LOGGING / SHUTDOWN
+# ==========================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(message)s",
+)
+logger = logging.getLogger("erc1155_scanner")
+
+shutdown_event = asyncio.Event()
+
+
+def request_shutdown() -> None:
+    logger.warning("Shutdown requested; finishing current requests...")
+    shutdown_event.set()
+
+
+def install_signal_handlers() -> None:
+    try:
+        signal.signal(signal.SIGINT, lambda *_: request_shutdown())
+        signal.signal(signal.SIGTERM, lambda *_: request_shutdown())
+    except Exception:
+        # Some environments do not allow signal registration.
+        pass
+
 
 # ==========================================================
 # RATE LIMITER
 # ==========================================================
 
-class AsyncRateLimiter:
-    def __init__(self, rate: float, burst: int):
-        self.rate = rate
-        self.capacity = burst
-        self.tokens = burst
-        self.updated = time.monotonic()
+class AsyncTokenBucket:
+    def __init__(self, rate: float, burst: int) -> None:
+        self.rate = max(0.1, float(rate))
+        self.capacity = max(1, int(burst))
+        self.tokens = float(self.capacity)
+        self.updated_at = time.monotonic()
         self.lock = asyncio.Lock()
 
-    async def acquire(self):
-        while True:
+    async def acquire(self) -> None:
+        while not shutdown_event.is_set():
             async with self.lock:
-
                 now = time.monotonic()
-                elapsed = now - self.updated
-                self.updated = now
+                elapsed = now - self.updated_at
+                self.updated_at = now
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
 
-                self.tokens = min(
-                    self.capacity,
-                    self.tokens + elapsed * self.rate
-                )
-
-                if self.tokens >= 1:
-                    self.tokens -= 1
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
                     return
 
-            await asyncio.sleep(0.01)
+                missing = 1.0 - self.tokens
+                sleep_for = min(1.0, missing / self.rate)
 
-rate_limiter = AsyncRateLimiter(
-    CFG.rate_limit_per_sec,
-    CFG.burst_size
-)
+            await asyncio.sleep(max(0.01, sleep_for))
 
-# ==========================================================
-# MEMORY CACHE
-# ==========================================================
-
-class LRUCache:
-    def __init__(self, capacity: int):
-        self.capacity = capacity
-        self.cache = OrderedDict()
-
-    def add(self, key: str):
-        self.cache[key] = True
-        self.cache.move_to_end(key)
-
-        if len(self.cache) > self.capacity:
-            self.cache.popitem(last=False)
-
-    def __contains__(self, key: str):
-        return key in self.cache
-
-memory_cache = LRUCache(CFG.memory_cache_size)
 
 # ==========================================================
-# SQLITE CACHE
+# FILE / STATE
 # ==========================================================
 
-class PersistentCache:
-    def __init__(self, path: str):
-        self.path = path
-        self.conn = sqlite3.connect(path)
-        self._setup()
+def load_existing_addresses(path: Path) -> Set[str]:
+    if not path.exists():
+        return set()
 
-    def _setup(self):
-        cur = self.conn.cursor()
+    out: Set[str] = set()
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip().lower()
+            if line.startswith("0x") and len(line) == 42:
+                out.add(line)
+    return out
 
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS checked_addresses (
-                address TEXT PRIMARY KEY
-            )
-        """)
 
-        self.conn.commit()
+def append_addresses(path: Path, addresses: Iterable[str]) -> int:
+    unique_sorted = sorted(set(a.lower() for a in addresses))
+    if not unique_sorted:
+        return 0
 
-    def contains(self, address: str) -> bool:
-        cur = self.conn.cursor()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        for address in unique_sorted:
+            f.write(address + "\n")
+    return len(unique_sorted)
 
-        cur.execute(
-            "SELECT 1 FROM checked_addresses WHERE address=? LIMIT 1",
-            (address,)
-        )
 
-        return cur.fetchone() is not None
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("State file is corrupted or unreadable: %s", path)
+        return {}
 
-    def add(self, address: str):
-        try:
-            cur = self.conn.cursor()
 
-            cur.execute(
-                "INSERT OR IGNORE INTO checked_addresses(address) VALUES(?)",
-                (address,)
-            )
+def save_state(path: Path, data: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(path)
 
-            self.conn.commit()
-
-        except Exception:
-            pass
-
-    def close(self):
-        self.conn.close()
-
-persistent_cache = PersistentCache(CFG.sqlite_cache_file)
-
-# ==========================================================
-# HELPERS
-# ==========================================================
-
-def compute_backoff(attempt: int) -> float:
-    base = min(
-        CFG.backoff_base ** attempt,
-        CFG.max_backoff
-    )
-
-    jitter = random.uniform(0.2, 1.0)
-
-    return base + jitter
 
 # ==========================================================
 # HTTP
 # ==========================================================
 
+def backoff_delay(attempt: int, base: float, max_backoff: float) -> float:
+    return min(max_backoff, base ** attempt) + random.uniform(0.15, 0.85)
+
+
 async def fetch_json(
     session: aiohttp.ClientSession,
-    params: Dict[str, Any]
+    limiter: AsyncTokenBucket,
+    cfg: Config,
+    stats: Stats,
+    params: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
+    request_params = dict(params)
+    request_params["apikey"] = cfg.api_key
 
-    request_params = {
-        **params,
-        "apikey": CFG.api_key,
-    }
-
-    for attempt in range(1, CFG.retry_limit + 1):
-
+    for attempt in range(1, cfg.retry_limit + 1):
         if shutdown_event.is_set():
             return None
 
-        await rate_limiter.acquire()
+        await limiter.acquire()
 
         try:
-            async with session.get(
-                CFG.base_url,
-                params=request_params
-            ) as response:
-
+            async with session.get(cfg.base_url, params=request_params) as response:
                 text = await response.text()
+                lowered = text.lower()
 
-                # Rate limit
-                if (
-                    response.status == 429
-                    or "rate limit" in text.lower()
-                    or "max rate limit reached" in text.lower()
-                ):
-                    delay = compute_backoff(attempt)
-
-                    logger.warning(
-                        "Rate limited, retrying in %.2fs",
-                        delay
-                    )
-
+                if response.status == 429 or any(m in lowered for m in RATE_LIMIT_MARKERS):
+                    stats.rate_limits += 1
+                    delay = backoff_delay(attempt, cfg.backoff_base, cfg.max_backoff)
+                    logger.warning("Rate limited; retry in %.2fs", delay)
                     await asyncio.sleep(delay)
                     continue
 
-                # Server errors
                 if response.status >= 500:
-                    await asyncio.sleep(compute_backoff(attempt))
+                    stats.retries += 1
+                    await asyncio.sleep(backoff_delay(attempt, cfg.backoff_base, cfg.max_backoff))
                     continue
 
-                # Client errors
                 if response.status >= 400:
-                    logger.error(
-                        "HTTP %s: %s",
-                        response.status,
-                        text[:200]
-                    )
+                    logger.error("HTTP %s: %s", response.status, text[:300])
                     return None
 
                 try:
-                    return await response.json(content_type=None)
-
-                except Exception:
-                    logger.error("Invalid JSON response")
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    logger.error("Invalid JSON: %s", text[:300])
                     return None
 
-        except (
-            aiohttp.ClientError,
-            asyncio.TimeoutError,
-            ConnectionResetError
-        ):
-            await asyncio.sleep(compute_backoff(attempt))
+        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as exc:
+            stats.retries += 1
+            delay = backoff_delay(attempt, cfg.backoff_base, cfg.max_backoff)
+            logger.warning("Network error: %s; retry in %.2fs", type(exc).__name__, delay)
+            await asyncio.sleep(delay)
 
     return None
 
-# ==========================================================
-# BLOCKCHAIN
-# ==========================================================
 
 async def get_latest_block(
-    session: aiohttp.ClientSession
+    session: aiohttp.ClientSession,
+    limiter: AsyncTokenBucket,
+    cfg: Config,
+    stats: Stats,
 ) -> Optional[int]:
-
-    data = await fetch_json(session, {
-        "module": "proxy",
-        "action": "eth_blockNumber",
-    })
-
+    data = await fetch_json(
+        session,
+        limiter,
+        cfg,
+        stats,
+        {"module": "proxy", "action": "eth_blockNumber"},
+    )
     try:
-        return int(data["result"], 16)
-
+        return int(str(data["result"]), 16)
     except Exception:
+        logger.error("Could not parse latest block response: %s", data)
         return None
 
-async def get_block_transactions(
-    session: aiohttp.ClientSession,
-    block_number: int
-) -> List[Dict[str, Any]]:
 
-    data = await fetch_json(session, {
-        "module": "proxy",
-        "action": "eth_getBlockByNumber",
-        "tag": hex(block_number),
-        "boolean": "true",
-    })
+# ==========================================================
+# SCANNING
+# ==========================================================
+
+def split_ranges(from_block: int, to_block: int, chunk_size: int) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    cur = from_block
+    while cur <= to_block:
+        end = min(to_block, cur + chunk_size - 1)
+        ranges.append((cur, end))
+        cur = end + 1
+    return ranges
+
+
+def is_no_records_response(data: Dict[str, Any]) -> bool:
+    message = str(data.get("message", "")).lower()
+    result = data.get("result")
+    if isinstance(result, str):
+        return any(marker in result.lower() for marker in NO_RECORDS_MARKERS)
+    return any(marker in message for marker in NO_RECORDS_MARKERS)
+
+
+async def get_logs_page(
+    session: aiohttp.ClientSession,
+    limiter: AsyncTokenBucket,
+    cfg: Config,
+    stats: Stats,
+    from_block: int,
+    to_block: int,
+    topic0: str,
+    page: int,
+) -> List[Dict[str, Any]]:
+    data = await fetch_json(
+        session,
+        limiter,
+        cfg,
+        stats,
+        {
+            "module": "logs",
+            "action": "getLogs",
+            "fromBlock": from_block,
+            "toBlock": to_block,
+            "topic0": topic0,
+            "page": page,
+            "offset": cfg.page_size,
+            "sort": "asc",
+        },
+    )
 
     if not isinstance(data, dict):
+        return []
+
+    if is_no_records_response(data):
         return []
 
     result = data.get("result")
+    if isinstance(result, list):
+        stats.log_pages += 1
+        stats.logs_seen += len(result)
+        return result
 
-    if not isinstance(result, dict):
-        return []
+    # PolygonScan sometimes returns status/message/result strings for errors.
+    logger.warning(
+        "Unexpected getLogs response for %s-%s page=%s: %s",
+        from_block,
+        to_block,
+        page,
+        str(data)[:300],
+    )
+    return []
 
-    return result.get("transactions", [])
 
-# ==========================================================
-# ERC1155 DETECTION
-# ==========================================================
-
-async def has_erc1155_activity(
+async def scan_topic_range(
     session: aiohttp.ClientSession,
-    address: str
-) -> bool:
-
-    # Memory cache
-    if address in memory_cache:
-        return False
-
-    # Persistent cache
-    if persistent_cache.contains(address):
-        memory_cache.add(address)
-        return False
-
-    data = await fetch_json(session, {
-        "module": "logs",
-        "action": "getLogs",
-        "fromBlock": "latest",
-        "toBlock": "latest",
-        "address": address,
-        "page": 1,
-        "offset": 3,
-    })
-
-    memory_cache.add(address)
-    persistent_cache.add(address)
-
-    if not isinstance(data, dict):
-        return False
-
-    logs = data.get("result")
-
-    if not isinstance(logs, list):
-        return False
-
-    for log in logs:
-
-        topics = log.get("topics", [])
-
-        if not topics:
-            continue
-
-        topic0 = str(topics[0]).lower()
-
-        if topic0 in ERC1155_TOPICS:
-            return True
-
-    return False
-
-# ==========================================================
-# FILE IO
-# ==========================================================
-
-async def load_existing(path: str) -> Set[str]:
-
-    if not os.path.exists(path):
-        return set()
-
-    async with aiofiles.open(path, "r") as f:
-        return {
-            line.strip().lower()
-            async for line in f
-            if line.strip()
-        }
-
-async def append_results(
-    path: str,
-    addresses: List[str]
-):
-
-    if not addresses:
-        return
-
-    async with aiofiles.open(path, "a") as f:
-        await f.write("\n".join(addresses) + "\n")
-
-# ==========================================================
-# STATS
-# ==========================================================
-
-class Stats:
-    def __init__(self):
-        self.total_addresses = 0
-        self.checked = 0
-        self.found = 0
-        self.start = time.perf_counter()
-
-stats = Stats()
-
-# ==========================================================
-# WORKER
-# ==========================================================
-
-async def worker(
-    name: str,
-    session: aiohttp.ClientSession,
-    queue: asyncio.Queue,
-    results: Set[str],
-    flush_buffer: List[str],
-    file_lock: asyncio.Lock,
-):
+    limiter: AsyncTokenBucket,
+    cfg: Config,
+    stats: Stats,
+    from_block: int,
+    to_block: int,
+    topic0: str,
+) -> Set[str]:
+    contracts: Set[str] = set()
+    page = 1
 
     while not shutdown_event.is_set():
-
-        try:
-            address = await asyncio.wait_for(
-                queue.get(),
-                timeout=1.0
-            )
-
-        except asyncio.TimeoutError:
-            if queue.empty():
-                return
-            continue
-
-        try:
-
-            if await has_erc1155_activity(session, address):
-
-                results.add(address)
-                flush_buffer.append(address)
-
-                stats.found += 1
-
-                logger.info(
-                    "[FOUND] %s",
-                    address
-                )
-
-                # Periodic flush
-                if len(flush_buffer) >= CFG.flush_every:
-
-                    async with file_lock:
-                        await append_results(
-                            CFG.output_file,
-                            flush_buffer
-                        )
-
-                    flush_buffer.clear()
-
-            stats.checked += 1
-
-            if stats.checked % 50 == 0:
-
-                elapsed = time.perf_counter() - stats.start
-                speed = stats.checked / elapsed if elapsed else 0
-
-                logger.info(
-                    "Checked=%d | Found=%d | Speed=%.2f addr/sec",
-                    stats.checked,
-                    stats.found,
-                    speed
-                )
-
-        finally:
-            queue.task_done()
-
-# ==========================================================
-# MAIN
-# ==========================================================
-
-async def main():
-
-    if not CFG.api_key:
-        raise RuntimeError(
-            "POLYGONSCAN_API_KEY environment variable missing"
+        logs = await get_logs_page(
+            session=session,
+            limiter=limiter,
+            cfg=cfg,
+            stats=stats,
+            from_block=from_block,
+            to_block=to_block,
+            topic0=topic0,
+            page=page,
         )
 
-    existing = await load_existing(CFG.output_file)
+        if not logs:
+            break
 
-    timeout = ClientTimeout(total=CFG.timeout)
+        for log in logs:
+            address = str(log.get("address", "")).lower()
+            if address.startswith("0x") and len(address) == 42:
+                contracts.add(address)
 
-    connector = TCPConnector(
-        limit=CFG.max_concurrency * CFG.tcp_limit_multiplier,
-        ttl_dns_cache=CFG.dns_ttl,
-        ssl=False,
+        if len(logs) < cfg.page_size:
+            break
+
+        page += 1
+
+    return contracts
+
+
+async def scan_chunk(
+    session: aiohttp.ClientSession,
+    limiter: AsyncTokenBucket,
+    cfg: Config,
+    stats: Stats,
+    semaphore: asyncio.Semaphore,
+    from_block: int,
+    to_block: int,
+) -> Set[str]:
+    async with semaphore:
+        found: Set[str] = set()
+        for topic0 in ERC1155_TOPICS:
+            if shutdown_event.is_set():
+                break
+            found.update(
+                await scan_topic_range(
+                    session=session,
+                    limiter=limiter,
+                    cfg=cfg,
+                    stats=stats,
+                    from_block=from_block,
+                    to_block=to_block,
+                    topic0=topic0,
+                )
+            )
+
+        stats.chunks_done += 1
+        if stats.chunks_done % 10 == 0:
+            logger.info(
+                "Chunks=%d | Logs=%d | Unique=%d | Speed=%.2f logs/sec",
+                stats.chunks_done,
+                stats.logs_seen,
+                stats.unique_contracts,
+                stats.logs_seen / stats.elapsed(),
+            )
+        return found
+
+
+async def scan_ranges(
+    session: aiohttp.ClientSession,
+    cfg: Config,
+    stats: Stats,
+    ranges: List[Tuple[int, int]],
+) -> Set[str]:
+    limiter = AsyncTokenBucket(cfg.rate_limit_per_sec, cfg.burst_size)
+    semaphore = asyncio.Semaphore(max(1, cfg.concurrency))
+
+    all_contracts: Set[str] = set()
+
+    tasks = [
+        asyncio.create_task(scan_chunk(session, limiter, cfg, stats, semaphore, a, b))
+        for a, b in ranges
+    ]
+
+    for task in asyncio.as_completed(tasks):
+        if shutdown_event.is_set():
+            for t in tasks:
+                t.cancel()
+            break
+
+        try:
+            all_contracts.update(await task)
+            stats.unique_contracts = len(all_contracts)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Chunk failed")
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+    return all_contracts
+
+
+# ==========================================================
+# CLI / MAIN
+# ==========================================================
+
+def parse_args() -> Config:
+    parser = argparse.ArgumentParser(description="Fast Polygon ERC1155 activity scanner")
+    parser.add_argument("--api-key", default=os.getenv("POLYGONSCAN_API_KEY", ""))
+    parser.add_argument("--base-url", default=os.getenv("POLYGONSCAN_BASE_URL", POLYGONSCAN_URL))
+    parser.add_argument("--output", default=os.getenv("OUTPUT_FILE", "erc1155_addresses.txt"))
+    parser.add_argument("--state", default=os.getenv("STATE_FILE", "erc1155_scanner_state.json"))
+    parser.add_argument("--blocks", type=int, default=int(os.getenv("BLOCKS_TO_SCAN", "500")))
+    parser.add_argument("--from-block", type=int, default=None)
+    parser.add_argument("--to-block", default=os.getenv("TO_BLOCK", "latest"))
+    parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", "100")))
+    parser.add_argument("--page-size", type=int, default=int(os.getenv("PAGE_SIZE", "1000")))
+    parser.add_argument("--rate", type=float, default=float(os.getenv("RATE_LIMIT_PER_SEC", "4.8")))
+    parser.add_argument("--burst", type=int, default=int(os.getenv("BURST_SIZE", "5")))
+    parser.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "4")))
+    parser.add_argument("--timeout", type=float, default=float(os.getenv("TIMEOUT", "20")))
+    parser.add_argument("--retries", type=int, default=int(os.getenv("RETRY_LIMIT", "6")))
+    parser.add_argument("--resume", action="store_true", help="Resume from last saved scanned block")
+    parser.add_argument("--no-state", action="store_true", help="Do not save scanner state")
+
+    args = parser.parse_args()
+
+    if not args.api_key:
+        raise SystemExit("Missing API key. Set POLYGONSCAN_API_KEY or pass --api-key.")
+
+    if args.blocks <= 0:
+        raise SystemExit("--blocks must be positive")
+    if args.chunk_size <= 0:
+        raise SystemExit("--chunk-size must be positive")
+    if args.page_size <= 0 or args.page_size > 1000:
+        raise SystemExit("--page-size should be between 1 and 1000")
+
+    return Config(
+        api_key=args.api_key,
+        base_url=args.base_url,
+        output_file=Path(args.output),
+        state_file=Path(args.state),
+        blocks=args.blocks,
+        from_block=args.from_block,
+        to_block=str(args.to_block),
+        chunk_size=args.chunk_size,
+        page_size=args.page_size,
+        rate_limit_per_sec=args.rate,
+        burst_size=args.burst,
+        concurrency=args.concurrency,
+        timeout=args.timeout,
+        retry_limit=args.retries,
+        backoff_base=1.8,
+        max_backoff=45.0,
+        dns_ttl=300,
+        resume=args.resume,
+        save_state=not args.no_state,
     )
 
-    async with aiohttp.ClientSession(
-        timeout=timeout,
-        connector=connector,
-    ) as session:
 
-        latest_block = await get_latest_block(session)
+async def main() -> None:
+    cfg = parse_args()
+    install_signal_handlers()
+
+    stats = Stats(started_at=time.perf_counter())
+    existing = load_existing_addresses(cfg.output_file)
+
+    timeout = ClientTimeout(total=cfg.timeout)
+    connector = TCPConnector(
+        limit=max(10, cfg.concurrency * 4),
+        ttl_dns_cache=cfg.dns_ttl,
+        ssl=False,
+        enable_cleanup_closed=True,
+    )
+
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+        bootstrap_limiter = AsyncTokenBucket(cfg.rate_limit_per_sec, cfg.burst_size)
+        latest_block = await get_latest_block(session, bootstrap_limiter, cfg, stats)
 
         if latest_block is None:
-            logger.error("Failed to fetch latest block")
+            raise SystemExit("Failed to get latest block")
+
+        if cfg.to_block.lower() == "latest":
+            to_block = latest_block
+        else:
+            to_block = int(cfg.to_block)
+
+        from_block: int
+        state = load_state(cfg.state_file) if cfg.resume else {}
+
+        if cfg.from_block is not None:
+            from_block = cfg.from_block
+        elif cfg.resume and isinstance(state.get("last_scanned_block"), int):
+            from_block = int(state["last_scanned_block"]) + 1
+        else:
+            from_block = max(0, to_block - cfg.blocks + 1)
+
+        if from_block > to_block:
+            logger.info("Nothing to scan: from_block=%d > to_block=%d", from_block, to_block)
             return
 
-        logger.info(
-            "Scanning last %d blocks...",
-            CFG.blocks_to_scan
-        )
-
-        addresses: Set[str] = set()
-
-        # Fetch blocks concurrently
-        block_tasks = []
-
-        for i in range(CFG.blocks_to_scan):
-
-            block_number = latest_block - i
-
-            block_tasks.append(
-                asyncio.create_task(
-                    get_block_transactions(
-                        session,
-                        block_number
-                    )
-                )
-            )
-
-        block_results = await asyncio.gather(*block_tasks)
-
-        for txs in block_results:
-
-            for tx in txs:
-
-                for field in ("from", "to"):
-
-                    addr = normalize_address(tx.get(field))
-
-                    if addr:
-                        addresses.add(addr)
-
-        # Remove already saved
-        addresses -= existing
-
-        if not addresses:
-            logger.info("No new addresses")
-            return
-
-        stats.total_addresses = len(addresses)
+        ranges = split_ranges(from_block, to_block, cfg.chunk_size)
 
         logger.info(
-            "Unique addresses collected: %d",
-            len(addresses)
+            "Scanning Polygon ERC1155 logs | blocks=%d-%d | chunks=%d | existing=%d",
+            from_block,
+            to_block,
+            len(ranges),
+            len(existing),
         )
 
-        # Queue
-        queue = asyncio.Queue(
-            maxsize=CFG.address_queue_size
-        )
+        contracts = await scan_ranges(session, cfg, stats, ranges)
+        new_contracts = contracts - existing
+        stats.new_contracts = len(new_contracts)
 
-        for addr in addresses:
-            await queue.put(addr)
+        written = append_addresses(cfg.output_file, new_contracts)
 
-        results = set()
-        flush_buffer = []
-        file_lock = asyncio.Lock()
-
-        workers = [
-
-            asyncio.create_task(
-                worker(
-                    f"worker-{i}",
-                    session,
-                    queue,
-                    results,
-                    flush_buffer,
-                    file_lock
-                )
+        if cfg.save_state and not shutdown_event.is_set():
+            save_state(
+                cfg.state_file,
+                {
+                    "last_scanned_block": to_block,
+                    "latest_block_at_run": latest_block,
+                    "output_file": str(cfg.output_file),
+                    "updated_at": int(time.time()),
+                },
             )
 
-            for i in range(CFG.worker_count)
-        ]
-
-        await queue.join()
-
-        # Stop workers
-        for w in workers:
-            w.cancel()
-
-        await asyncio.gather(
-            *workers,
-            return_exceptions=True
-        )
-
-        # Final flush
-        if flush_buffer:
-
-            async with file_lock:
-                await append_results(
-                    CFG.output_file,
-                    flush_buffer
-                )
-
-        elapsed = time.perf_counter() - stats.start
-
-        logger.info("=" * 60)
+        logger.info("=" * 72)
         logger.info("DONE")
-        logger.info("Checked: %d", stats.checked)
-        logger.info("Found: %d", stats.found)
-        logger.info("Elapsed: %.2fs", elapsed)
+        logger.info("Block range:       %d-%d", from_block, to_block)
+        logger.info("Logs seen:         %d", stats.logs_seen)
+        logger.info("Log pages:         %d", stats.log_pages)
+        logger.info("Unique contracts:  %d", len(contracts))
+        logger.info("Already existing:  %d", len(contracts & existing))
+        logger.info("New written:       %d", written)
+        logger.info("Rate limits:       %d", stats.rate_limits)
+        logger.info("Retries:           %d", stats.retries)
+        logger.info("Elapsed:           %.2fs", stats.elapsed())
+        logger.info("Log speed:         %.2f logs/sec", stats.logs_seen / stats.elapsed())
+        logger.info("Output:            %s", cfg.output_file)
+        logger.info("=" * 72)
 
-        if elapsed > 0:
-            logger.info(
-                "Speed: %.2f addr/sec",
-                stats.checked / elapsed
-            )
-
-        logger.info("=" * 60)
-
-    persistent_cache.close()
-
-# ==========================================================
-# ENTRY
-# ==========================================================
 
 if __name__ == "__main__":
-
     if sys.platform.startswith("win"):
-        asyncio.set_event_loop_policy(
-            asyncio.WindowsSelectorEventLoopPolicy()
-        )
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     try:
         asyncio.run(main())
-
     except KeyboardInterrupt:
-        logger.warning("Interrupted")
-
-    finally:
-        persistent_cache.close()
-
-
-# IMPROVEMENTS SUGGESTED:
-# - fixed invalid ERC1155 batch topic
-# - use eth_getLogs topic0 filter instead of fetching latest logs per address
-# - WAL sqlite, batched commits, semaphores, uvloop(optional), structured stats
+        request_shutdown()
