@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reliable asynchronous Polygon ERC-1155 activity scanner.
+"""Reliable asynchronous Polygon ERC-1155 activity scanner (v4).
 
 Scans ERC-1155 TransferSingle and TransferBatch logs and stores unique
 contract addresses. Uses Etherscan API V2 with Polygon chain id 137.
@@ -8,10 +8,12 @@ Highlights:
 - Etherscan API V2 support (chainid=137)
 - bounded worker queue instead of creating one task per range
 - adaptive block-range splitting on query timeout / result-window saturation
+- pagination safety ceiling that still permits very dense single-block ranges
 - retries for HTTP, API-level, malformed JSON and transient errors
-- progress checkpoint stores only contiguous completed ranges
+- monotonic progress checkpoint stores only contiguous completed ranges
 - graceful shutdown without falsely marking unfinished blocks as scanned
 - atomic state writes and optional output rewrite/deduplication
+- optional confirmation depth to avoid scanning the unstable chain tip
 - strict address/block/config validation
 
 Requirements:
@@ -19,9 +21,9 @@ Requirements:
 
 Examples:
     set ETHERSCAN_API_KEY=YOUR_KEY
-    python erc1155_polygon_scanner_v3.py --blocks 5000
-    python erc1155_polygon_scanner_v3.py --from-block 65000000 --to-block latest
-    python erc1155_polygon_scanner_v3.py --resume
+    python erc1155_polygon_scanner_v4.py --blocks 5000
+    python erc1155_polygon_scanner_v4.py --from-block 65000000 --to-block latest
+    python erc1155_polygon_scanner_v4.py --resume
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ import re
 import signal
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -92,6 +94,8 @@ class Config:
     chunk_size: int
     min_chunk_size: int
     page_size: int
+    split_after_pages: int
+    max_pages_per_range: int
     concurrency: int
     rate_limit: float
     burst_size: int
@@ -100,6 +104,7 @@ class Config:
     backoff_base: float
     max_backoff: float
     dns_ttl: int
+    confirmations: int
     resume: bool
     save_state: bool
     rewrite_output: bool
@@ -267,10 +272,12 @@ def save_state_atomic(path: Path, payload: Mapping[str, Any]) -> None:
 
 
 def retry_delay(attempt: int, cfg: Config, retry_after: str | None = None) -> float:
+    # Retry-After is commonly a number of seconds. If it is an HTTP date,
+    # falling back to exponential jitter is safer than guessing.
     if retry_after:
         try:
-            return min(cfg.max_backoff, max(0.1, float(retry_after)))
-        except ValueError:
+            return min(cfg.max_backoff, max(0.1, float(retry_after.strip())))
+        except (TypeError, ValueError):
             pass
     ceiling = min(cfg.max_backoff, cfg.backoff_base * (2 ** (attempt - 1)))
     return random.uniform(0.25, max(0.25, ceiling))
@@ -292,6 +299,7 @@ async def fetch_json(
     last_error = "unknown error"
 
     for attempt in range(1, cfg.retries + 1):
+        retry_after: str | None = None
         if shutdown.event.is_set():
             raise asyncio.CancelledError
         await limiter.acquire()
@@ -304,7 +312,7 @@ async def fetch_json(
                 if response.status == 429:
                     stats.rate_limits += 1
                     last_error = f"HTTP 429: {text[:200]}"
-                elif response.status >= 500:
+                elif response.status in (408, 425) or response.status >= 500:
                     last_error = f"HTTP {response.status}: {text[:200]}"
                 elif response.status >= 400:
                     raise ApiError(f"HTTP {response.status}: {text[:500]}")
@@ -342,7 +350,7 @@ async def fetch_json(
 
         if attempt < cfg.retries:
             stats.retries += 1
-            delay = retry_delay(attempt, cfg, retry_after if 'retry_after' in locals() else None)
+            delay = retry_delay(attempt, cfg, retry_after)
             logger.warning("Request failed (%s); retry %d/%d in %.2fs", last_error, attempt, cfg.retries, delay)
             try:
                 await asyncio.wait_for(shutdown.event.wait(), timeout=delay)
@@ -414,11 +422,19 @@ async def scan_topic(
         if len(result) < cfg.page_size:
             break
 
-        # A full page can mean there are more pages. At a practical API page
-        # ceiling, split the range instead of risking a silently truncated scan.
+        # A full page means there may be more data. Prefer splitting wide
+        # ranges after a configurable number of pages, but do not fail merely
+        # because a single/minimum-size block is exceptionally dense.
         page += 1
-        if page > 10:
-            raise SplitRange(f"more than 10 full pages for {item.start}-{item.end}")
+        if page > cfg.max_pages_per_range:
+            raise ApiError(
+                f"pagination safety ceiling exceeded for {item.start}-{item.end} "
+                f"(>{cfg.max_pages_per_range} pages)"
+            )
+        if page > cfg.split_after_pages and item.size > cfg.min_chunk_size:
+            raise SplitRange(
+                f"more than {cfg.split_after_pages} full pages for {item.start}-{item.end}"
+            )
 
     return contracts
 
@@ -464,21 +480,28 @@ async def run_workers(
     discovered: set[str] = set()
     discovery_lock = asyncio.Lock()
     fatal_errors: list[str] = []
+    checkpoint_lock = asyncio.Lock()
+    last_checkpoint = tracker.last_contiguous_block
 
     async def checkpoint(last_block: int) -> None:
-        if not cfg.save_state:
+        nonlocal last_checkpoint
+        if not cfg.save_state or last_block <= last_checkpoint:
             return
-        save_state_atomic(
-            cfg.state_file,
-            {
-                "version": 3,
+        async with checkpoint_lock:
+            if last_block <= last_checkpoint:
+                return
+            save_state_atomic(
+                cfg.state_file,
+                {
+                    "version": 4,
                 "chain_id": cfg.chain_id,
                 "last_scanned_block": last_block,
                 "latest_block_at_run": latest_at_start,
                 "output_file": str(cfg.output_file),
-                "updated_at": int(time.time()),
-            },
-        )
+                    "updated_at": int(time.time()),
+                },
+            )
+            last_checkpoint = last_block
 
     async def worker(worker_id: int) -> None:
         while True:
@@ -554,11 +577,19 @@ def parse_args() -> Config:
     parser.add_argument("--chunk-size", type=int, default=int(os.getenv("CHUNK_SIZE", "100")))
     parser.add_argument("--min-chunk-size", type=int, default=int(os.getenv("MIN_CHUNK_SIZE", "1")))
     parser.add_argument("--page-size", type=int, default=int(os.getenv("PAGE_SIZE", "1000")))
+    parser.add_argument("--split-after-pages", type=int, default=int(os.getenv("SPLIT_AFTER_PAGES", "10")))
+    parser.add_argument("--max-pages-per-range", type=int, default=int(os.getenv("MAX_PAGES_PER_RANGE", "1000")))
     parser.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "4")))
     parser.add_argument("--rate", type=float, default=float(os.getenv("RATE_LIMIT_PER_SEC", "4.5")))
     parser.add_argument("--burst", type=int, default=int(os.getenv("BURST_SIZE", "4")))
     parser.add_argument("--timeout", type=float, default=float(os.getenv("TIMEOUT", "30")))
     parser.add_argument("--retries", type=int, default=int(os.getenv("RETRY_LIMIT", "7")))
+    parser.add_argument(
+        "--confirmations",
+        type=int,
+        default=int(os.getenv("CONFIRMATIONS", "0")),
+        help="When --to-block=latest, stop this many blocks behind the chain head",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--rewrite-output", action="store_true", help="Sort and deduplicate the output before scanning")
@@ -575,6 +606,12 @@ def parse_args() -> Config:
         parser.error("--min-chunk-size cannot exceed --chunk-size")
     if not 1 <= args.page_size <= 1000:
         parser.error("--page-size must be between 1 and 1000")
+    if args.split_after_pages <= 0 or args.max_pages_per_range <= 0:
+        parser.error("--split-after-pages and --max-pages-per-range must be positive")
+    if args.split_after_pages >= args.max_pages_per_range:
+        parser.error("--split-after-pages must be smaller than --max-pages-per-range")
+    if args.confirmations < 0:
+        parser.error("--confirmations cannot be negative")
     if args.concurrency <= 0 or args.rate <= 0 or args.burst <= 0:
         parser.error("--concurrency, --rate and --burst must be positive")
     if args.timeout <= 0 or args.retries <= 0:
@@ -601,6 +638,8 @@ def parse_args() -> Config:
         chunk_size=args.chunk_size,
         min_chunk_size=args.min_chunk_size,
         page_size=args.page_size,
+        split_after_pages=args.split_after_pages,
+        max_pages_per_range=args.max_pages_per_range,
         concurrency=args.concurrency,
         rate_limit=args.rate,
         burst_size=args.burst,
@@ -609,6 +648,7 @@ def parse_args() -> Config:
         backoff_base=1.0,
         max_backoff=60.0,
         dns_ttl=300,
+        confirmations=args.confirmations,
         resume=args.resume,
         save_state=not args.no_state,
         rewrite_output=args.rewrite_output,
@@ -632,12 +672,15 @@ async def async_main(cfg: Config) -> int:
         ttl_dns_cache=cfg.dns_ttl,
         enable_cleanup_closed=True,
     )
-    headers = {"Accept": "application/json", "User-Agent": "erc1155-polygon-scanner/3.0"}
+    headers = {"Accept": "application/json", "User-Agent": "erc1155-polygon-scanner/4.0"}
 
     async with ClientSession(timeout=timeout, connector=connector, headers=headers) as session:
         limiter = TokenBucket(cfg.rate_limit, cfg.burst_size, shutdown)
         chain_head = await latest_block(session, limiter, cfg, stats, shutdown)
-        to_block = chain_head if cfg.to_block.lower() == "latest" else int(cfg.to_block)
+        if cfg.to_block.lower() == "latest":
+            to_block = max(0, chain_head - cfg.confirmations)
+        else:
+            to_block = int(cfg.to_block)
         if to_block > chain_head:
             logger.warning("Requested to-block %d is above current head %d; clamping", to_block, chain_head)
             to_block = chain_head
@@ -648,6 +691,14 @@ async def async_main(cfg: Config) -> int:
         elif cfg.resume and isinstance(state.get("last_scanned_block"), int):
             if state.get("chain_id") not in (None, cfg.chain_id):
                 raise ScannerError("state file belongs to a different chain_id")
+            state_output = state.get("output_file")
+            if state_output and Path(str(state_output)) != cfg.output_file:
+                logger.warning(
+                    "State was created with output %s, current output is %s; "
+                    "resume remains valid but previously found addresses may be in the old file",
+                    state_output,
+                    cfg.output_file,
+                )
             from_block = int(state["last_scanned_block"]) + 1
         else:
             from_block = max(0, to_block - cfg.blocks + 1)
@@ -659,8 +710,8 @@ async def async_main(cfg: Config) -> int:
         ranges = initial_ranges(from_block, to_block, cfg.chunk_size)
         tracker = ProgressTracker(from_block)
         logger.info(
-            "Scanning chain=%d blocks=%d-%d ranges=%d chunk=%d concurrency=%d existing=%d",
-            cfg.chain_id, from_block, to_block, len(ranges), cfg.chunk_size, cfg.concurrency, len(existing),
+            "Scanning chain=%d blocks=%d-%d ranges=%d chunk=%d concurrency=%d existing=%d confirmations=%d",
+            cfg.chain_id, from_block, to_block, len(ranges), cfg.chunk_size, cfg.concurrency, len(existing), cfg.confirmations,
         )
 
         discovered, errors = await run_workers(
