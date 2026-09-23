@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
 """
-Reliable asynchronous ERC-1155 activity scanner for Etherscan API V2 (v5).
+Reliable asynchronous ERC-1155 activity scanner for Etherscan API V2 (v6).
 
 Scans ERC-1155 TransferSingle and TransferBatch logs and stores unique
 contract addresses. Defaults to Polygon (chain id 137), but --chain-id can
 be changed for any chain supported by Etherscan API V2.
 
-Main improvements over v4:
+Main improvements over v5:
+- minimum-chunk-aware splitting: ranges are split only when both children can
+  satisfy --min-chunk-size, preventing accidental undersized child ranges;
+- split decisions are centralized and validated instead of being repaired after
+  a naive midpoint split;
+- safer cancellation teardown always persists the latest contiguous checkpoint;
+- output/state path collision is rejected to prevent destructive misconfiguration;
+- configuration now rejects non-finite numeric values and impossible split limits.
+
+Retained reliability improvements:
 - shutdown-safe worker pool: a failed/cancelled worker cannot strand queue
   items and make queue.join() hang forever;
 - clean distinction between user shutdown, fatal errors and normal completion;
@@ -39,6 +48,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -332,7 +342,7 @@ class CheckpointWriter:
 
     def _payload(self, last_block: int) -> dict[str, Any]:
         return {
-            "version": 5,
+            "version": 6,
             "chain_id": self.cfg.chain_id,
             "scan_start_block": self.scan_start,
             "scan_target_block": self.scan_target,
@@ -779,7 +789,7 @@ async def scan_topic(
                 "page": page,
                 "offset": cfg.page_size,
             },
-            allow_split=item.size > cfg.min_chunk_size,
+            allow_split=item.size >= 2 * cfg.min_chunk_size,
         )
 
         result = data.get("result")
@@ -813,7 +823,7 @@ async def scan_topic(
             break
 
         if page >= cfg.max_pages_per_range:
-            if item.size > cfg.min_chunk_size:
+            if item.size >= 2 * cfg.min_chunk_size:
                 raise SplitRange(
                     f"pagination ceiling reached for "
                     f"{item.start}-{item.end} "
@@ -829,7 +839,7 @@ async def scan_topic(
 
         if (
             page > cfg.split_after_pages
-            and item.size > cfg.min_chunk_size
+            and item.size >= 2 * cfg.min_chunk_size
         ):
             raise SplitRange(
                 f"more than {cfg.split_after_pages} full pages for "
@@ -865,20 +875,27 @@ async def scan_item(
     return found
 
 
-def split_item(item: WorkItem) -> tuple[WorkItem, WorkItem]:
-    if item.size <= 1:
-        raise ValueError(f"cannot split single-block range {item}")
+def split_item(item: WorkItem, min_size: int = 1) -> tuple[WorkItem, WorkItem]:
+    """Split *item* into two contiguous children, each at least *min_size*."""
+    if min_size <= 0:
+        raise ValueError("min_size must be > 0")
+    if item.size < 2 * min_size:
+        raise ValueError(
+            f"cannot split range {item.start}-{item.end} of size {item.size} "
+            f"into two children of at least {min_size} blocks"
+        )
 
-    middle = (item.start + item.end) // 2
+    # Keep the split as balanced as possible while respecting the minimum.
+    left_size = item.size // 2
+    left_size = max(min_size, min(left_size, item.size - min_size))
+    middle = item.start + left_size - 1
     left = WorkItem(item.start, middle)
     right = WorkItem(middle + 1, item.end)
 
-    if left.size <= 0 or right.size <= 0:
-        raise ScannerError(f"invalid split result for {item}")
-
+    if left.size < min_size or right.size < min_size:
+        raise ScannerError(f"invalid minimum-aware split for {item}")
     if left.start != item.start or right.end != item.end:
         raise ScannerError(f"split does not cover original range {item}")
-
     if left.end + 1 != right.start:
         raise ScannerError(f"split created a gap/overlap for {item}")
 
@@ -986,29 +1003,13 @@ async def run_workers(
                             f"still requested a split: {exc}"
                         ) from exc
 
-                    left, right = split_item(item)
-
-                    if left.size < cfg.min_chunk_size:
-                        # For non-power-of-two sizes a naive split could create
-                        # a child below the configured minimum. Shift boundary.
-                        left = WorkItem(
-                            item.start,
-                            item.start + cfg.min_chunk_size - 1,
-                        )
-                        right = WorkItem(left.end + 1, item.end)
-
-                    if right.size < cfg.min_chunk_size:
-                        right = WorkItem(
-                            item.end - cfg.min_chunk_size + 1,
-                            item.end,
-                        )
-                        left = WorkItem(item.start, right.start - 1)
-
-                    if left.size <= 0 or right.size <= 0:
+                    try:
+                        left, right = split_item(item, cfg.min_chunk_size)
+                    except ValueError as split_exc:
                         raise ApiError(
                             f"cannot split {item.start}-{item.end} while "
-                            f"respecting min chunk {cfg.min_chunk_size}"
-                        )
+                            f"respecting min chunk {cfg.min_chunk_size}: {split_exc}"
+                        ) from split_exc
 
                     stats.ranges_split += 1
                     logger.info(
@@ -1088,6 +1089,8 @@ async def run_workers(
         for task in workers:
             task.cancel()
         await asyncio.gather(*workers, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await checkpoint.force_current()
         raise
 
     # The queue is empty and every queued item has task_done() accounted for.
@@ -1135,8 +1138,8 @@ def _positive_float(value: str) -> float:
     except ValueError as exc:
         raise argparse.ArgumentTypeError("must be a number") from exc
 
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a finite number > 0")
 
     return parsed
 
@@ -1337,6 +1340,18 @@ def parse_args() -> Config:
     if args.max_backoff < args.backoff_base:
         parser.error("--max-backoff cannot be smaller than --backoff-base")
 
+    if args.chunk_size < 2 * args.min_chunk_size and args.chunk_size != args.min_chunk_size:
+        parser.error(
+            "--chunk-size must equal --min-chunk-size or be at least twice as large"
+        )
+
+    try:
+        same_path = Path(args.output).resolve() == Path(args.state).resolve()
+    except OSError:
+        same_path = Path(args.output) == Path(args.state)
+    if same_path:
+        parser.error("--output and --state must refer to different files")
+
     to_block = str(args.to_block).strip().lower()
     if to_block != "latest":
         try:
@@ -1463,7 +1478,7 @@ async def async_main(cfg: Config) -> int:
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "erc1155-etherscan-v2-scanner/5.0",
+        "User-Agent": "erc1155-etherscan-v2-scanner/6.0",
     }
 
     tracker: ProgressTracker | None = None
