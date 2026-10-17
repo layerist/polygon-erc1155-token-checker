@@ -1,44 +1,28 @@
 #!/usr/bin/env python3
 """
-Reliable asynchronous ERC-1155 activity scanner for Etherscan API V2 (v6).
+Reliable asynchronous ERC-1155 activity scanner for Etherscan API V2.
 
 Scans ERC-1155 TransferSingle and TransferBatch logs and stores unique
 contract addresses. Defaults to Polygon (chain id 137), but --chain-id can
 be changed for any chain supported by Etherscan API V2.
 
-Main improvements over v5:
-- minimum-chunk-aware splitting: ranges are split only when both children can
-  satisfy --min-chunk-size, preventing accidental undersized child ranges;
-- split decisions are centralized and validated instead of being repaired after
-  a naive midpoint split;
-- safer cancellation teardown always persists the latest contiguous checkpoint;
-- output/state path collision is rejected to prevent destructive misconfiguration;
-- configuration now rejects non-finite numeric values and impossible split limits.
-
-Retained reliability improvements:
-- shutdown-safe worker pool: a failed/cancelled worker cannot strand queue
-  items and make queue.join() hang forever;
-- clean distinction between user shutdown, fatal errors and normal completion;
-- range-too-large responses are retried at minimum chunk size instead of
-  immediately turning a transient API timeout into a fatal error;
-- monotonic contiguous checkpointing with throttled state writes and a forced
-  final checkpoint (re-scanning after a crash is possible; skipping blocks is not);
-- stricter progress bookkeeping and split-range validation;
-- Retry-After supports both seconds and HTTP-date form;
-- unique atomic temp files + fsync for more durable state/output replacement;
-- safer environment/CLI parsing and broader configuration controls;
-- time-based progress reporting with blocks/request throughput;
-- final completion is determined by contiguous scanned coverage, not merely by
-  whether a shutdown signal happened near the end.
+Reliability features:
+- adaptive range splitting with minimum child sizes and bounded pagination;
+- rate limiting, retries, and interruptible backoff;
+- explicit validation of API log entries to prevent silent data loss;
+- shutdown-safe workers, contiguous checkpointing, and atomic state writes;
+- persistent, deduplicated address output with append failure recovery;
+- safe resume checks for chain and output-file identity;
+- configurable timeouts, progress reporting, and CLI options.
 
 Requirements:
     pip install aiohttp
 
 Examples:
     set ETHERSCAN_API_KEY=YOUR_KEY
-    python erc1155_polygon_scanner_v5.py --blocks 5000
-    python erc1155_polygon_scanner_v5.py --from-block 65000000 --to-block latest
-    python erc1155_polygon_scanner_v5.py --resume
+    python erc1155_etherscan_scanner_improved.py --blocks 5000
+    python erc1155_etherscan_scanner_improved.py --from-block 65000000 --to-block latest
+    python erc1155_etherscan_scanner_improved.py --resume
 """
 
 from __future__ import annotations
@@ -55,6 +39,7 @@ import re
 import signal
 import tempfile
 import time
+from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -287,6 +272,7 @@ class ProgressTracker:
         self.scan_start = scan_start
         self.next_block = scan_start
         self.completed: dict[int, int] = {}
+        self.completed_starts: list[int] = []
         self.lock = asyncio.Lock()
 
     async def mark_done(self, item: WorkItem) -> int:
@@ -296,20 +282,38 @@ class ProgressTracker:
                 # idempotent is safer than moving progress backwards.
                 return self.next_block - 1
 
+            if item.start < self.next_block:
+                raise ScannerError(
+                    f"completed range {item.start}-{item.end} overlaps "
+                    f"contiguous progress through {self.next_block - 1}"
+                )
+
             previous = self.completed.get(item.start)
-            if previous is not None and previous != item.end:
+            if previous is not None:
+                if previous == item.end:
+                    return self.next_block - 1
                 raise ScannerError(
                     f"conflicting completed ranges at {item.start}: "
                     f"{previous} vs {item.end}"
                 )
 
-            self.completed[item.start] = item.end
+            # Check only adjacent completed intervals, avoiding an O(n) scan
+            # for every item when many later ranges finish ahead of a gap.
+            index = bisect_left(self.completed_starts, item.start)
+            if index and self.completed[self.completed_starts[index - 1]] >= item.start:
+                raise ScannerError(f"completed range {item} overlaps an earlier range")
+            if index < len(self.completed_starts) and item.end >= self.completed_starts[index]:
+                raise ScannerError(f"completed range {item} overlaps a later range")
 
-            while True:
-                end = self.completed.pop(self.next_block, None)
-                if end is None:
-                    break
+            self.completed[item.start] = item.end
+            self.completed_starts.insert(index, item.start)
+
+            advanced = 0
+            while (end := self.completed.pop(self.next_block, None)) is not None:
                 self.next_block = end + 1
+                advanced += 1
+            if advanced:
+                del self.completed_starts[:advanced]
 
             return self.next_block - 1
 
@@ -349,7 +353,7 @@ class CheckpointWriter:
             "last_scanned_block": last_block,
             "latest_block_at_run": self.latest_at_start,
             "confirmations": self.cfg.confirmations,
-            "output_file": str(self.cfg.output_file),
+            "output_file": str(self.cfg.output_file.resolve()),
             "updated_at": int(time.time()),
         }
 
@@ -508,15 +512,39 @@ def append_addresses(path: Path, addresses: Iterable[str], *, fsync: bool) -> in
 
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    payload = "".join(f"{value}\n" for value in normalized).encode("ascii")
     try:
-        with path.open("a", encoding="utf-8", newline="\n") as handle:
-            handle.writelines(f"{value}\n" for value in normalized)
-            handle.flush()
-            if fsync:
-                os.fsync(handle.fileno())
+        # A pre-existing incomplete line (e.g. after an interrupted write)
+        # must not be joined to the first address of this batch.
+        with path.open("a+b") as handle:
+            handle.seek(0, os.SEEK_END)
+            old_size = handle.tell()
+            try:
+                if old_size:
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+                handle.seek(0, os.SEEK_END)
+                handle.write(payload)
+                handle.flush()
+                if fsync:
+                    os.fsync(handle.fileno())
+            except OSError:
+                # Best-effort rollback of a partially written batch. The
+                # checkpoint was not advanced, so resume can safely retry.
+                with contextlib.suppress(OSError):
+                    handle.truncate(old_size)
+                    handle.flush()
+                    if fsync:
+                        os.fsync(handle.fileno())
+                raise
     except OSError as exc:
         raise ScannerError(f"cannot append to output file {path}: {exc}") from exc
 
+    if fsync and old_size == 0:
+        # Persist the directory entry of a newly created output file before
+        # any subsequent checkpoint can claim the batch was saved.
+        _fsync_parent_directory(path)
     return len(normalized)
 
 
@@ -558,8 +586,10 @@ def retry_after_seconds(value: str | None, max_backoff: float) -> float | None:
     except ValueError:
         seconds = -1.0
 
-    if seconds >= 0:
+    if math.isfinite(seconds) and seconds >= 0:
         return min(max_backoff, max(0.05, seconds))
+    if math.isinf(seconds) and seconds > 0:
+        return max_backoff
 
     try:
         dt = parsedate_to_datetime(value)
@@ -569,7 +599,10 @@ def retry_after_seconds(value: str | None, max_backoff: float) -> float | None:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
 
-    seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    try:
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    except (OverflowError, ValueError):
+        return None
     return min(max_backoff, max(0.05, seconds))
 
 
@@ -679,7 +712,7 @@ async def fetch_json(
                             status = str(data.get("status", ""))
                             message = str(data.get("message", ""))
 
-                            if status == "0" and message.upper() == "NOTOK":
+                            if status == "0" or message.upper() == "NOTOK":
                                 if contains_marker(combined, TRANSIENT_MARKERS):
                                     if "rate limit" in combined:
                                         stats.rate_limits += 1
@@ -812,12 +845,19 @@ async def scan_topic(
         stats.pages += 1
         stats.logs_seen += len(result)
 
-        for entry in result:
+        for index, entry in enumerate(result):
             if not isinstance(entry, dict):
-                continue
+                raise ApiError(
+                    f"invalid log entry {index} in {item.start}-{item.end}, "
+                    f"page {page}: expected object, got {type(entry).__name__}"
+                )
             address = normalize_address(entry.get("address", ""))
-            if address is not None:
-                contracts.add(address)
+            if address is None:
+                raise ApiError(
+                    f"invalid log address at entry {index} in "
+                    f"{item.start}-{item.end}, page {page}"
+                )
+            contracts.add(address)
 
         if len(result) < cfg.page_size:
             break
@@ -1345,10 +1385,14 @@ def parse_args() -> Config:
             "--chunk-size must equal --min-chunk-size or be at least twice as large"
         )
 
+    output_path = Path(args.output)
+    state_path = Path(args.state)
     try:
-        same_path = Path(args.output).resolve() == Path(args.state).resolve()
+        same_path = output_path.resolve() == state_path.resolve()
+        if not same_path and output_path.exists() and state_path.exists():
+            same_path = output_path.samefile(state_path)
     except OSError:
-        same_path = Path(args.output) == Path(args.state)
+        same_path = output_path == state_path
     if same_path:
         parser.error("--output and --state must refer to different files")
 
@@ -1423,7 +1467,7 @@ def resolve_resume_start(
             )
 
         last_scanned = state.get("last_scanned_block")
-        if isinstance(last_scanned, int) and last_scanned >= -1:
+        if type(last_scanned) is int and last_scanned >= -1:
             state_output = state.get("output_file")
             if state_output:
                 try:
@@ -1435,12 +1479,11 @@ def resolve_resume_start(
                     same_output = Path(str(state_output)) == cfg.output_file
 
                 if not same_output:
-                    logger.warning(
-                        "State was created with output %s, current output is %s; "
-                        "resume block is valid, but old addresses may live in "
-                        "the previous output file",
-                        state_output,
-                        cfg.output_file,
+                    raise ScannerError(
+                        f"state was created with output {state_output}, but "
+                        f"current output is {cfg.output_file}; refusing to skip "
+                        "previously scanned blocks. Use the original output "
+                        "or specify --from-block for an explicit new scan."
                     )
 
             return last_scanned + 1
@@ -1643,7 +1686,7 @@ def main() -> int:
         configure_logging(cfg.log_level)
         return asyncio.run(async_main(cfg))
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ShutdownRequested):
         return 130
 
     except (ScannerError, OSError, ValueError) as exc:
