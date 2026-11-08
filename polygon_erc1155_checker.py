@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
@@ -674,11 +675,22 @@ async def fetch_json(
         retry_after: str | None = None
 
         try:
-            async with session.get(cfg.api_url, params=query) as response:
+            async with session.get(
+                cfg.api_url, params=query, allow_redirects=False
+            ) as response:
                 retry_after = response.headers.get("Retry-After")
                 text = await response.text(errors="replace")
 
-                if response.status == 429:
+                if 300 <= response.status < 400:
+                    # The API key is sent in the query string. Never follow a
+                    # redirect that could forward it to an unrelated host.
+                    stats.api_errors += 1
+                    raise ApiError(
+                        f"HTTP redirect {response.status} refused: "
+                        f"{response.headers.get('Location', '<no Location header>')}"
+                    )
+
+                elif response.status == 429:
                     stats.rate_limits += 1
                     last_error = f"HTTP 429: {text[:300]}"
 
@@ -1363,8 +1375,18 @@ def parse_args() -> Config:
             "or pass --api-key"
         )
 
-    if not api_url.startswith(("https://", "http://")):
-        parser.error("--api-url must start with http:// or https://")
+    parsed_api_url = urlsplit(api_url)
+    if (
+        parsed_api_url.scheme not in {"https", "http"}
+        or not parsed_api_url.hostname
+        or parsed_api_url.username is not None
+        or parsed_api_url.password is not None
+        or parsed_api_url.fragment
+    ):
+        parser.error(
+            "--api-url must be an absolute HTTP(S) URL without embedded "
+            "credentials or a fragment"
+        )
 
     if args.min_chunk_size > args.chunk_size:
         parser.error("--min-chunk-size cannot exceed --chunk-size")
@@ -1460,7 +1482,9 @@ def resolve_resume_start(
 
     if cfg.resume:
         state_chain = state.get("chain_id")
-        if state_chain is not None and state_chain != cfg.chain_id:
+        if state_chain is not None and (
+            type(state_chain) is not int or state_chain != cfg.chain_id
+        ):
             raise ScannerError(
                 f"state file belongs to chain_id={state_chain}, "
                 f"current chain_id={cfg.chain_id}"
@@ -1521,7 +1545,7 @@ async def async_main(cfg: Config) -> int:
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "erc1155-etherscan-v2-scanner/6.0",
+        "User-Agent": "erc1155-etherscan-v2-scanner/6.1",
     }
 
     tracker: ProgressTracker | None = None
